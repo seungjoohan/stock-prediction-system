@@ -5,7 +5,9 @@
     I am focusing on learning ML system architecture, I will not focus on training the accurate model.
 
     ## Predicting stock price 
-    ``` streamlit run predict_stocks.py ```
+    ```bash
+    streamlit run predict_stocks.py
+    ```
 
     ## Current implementation
         Deploying stock prediction app using Streamlit.
