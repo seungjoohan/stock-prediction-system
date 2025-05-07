@@ -17,11 +17,11 @@ streamlit run predict_stocks.py
  - Deploying stock prediction app using Streamlit.
  - Train very simple chosen (Prophet/ARIMA) model on the fly
  - Generate prediction plots
+ - Automatically download data files at 00:00 UTC every day or when manually activate 'Update Stock Data' action.
 
 ## TODO
 
  - Add model validation
- - Train & save default model - prophet / arima / vaniall NN 
- - Streaming-like data updates: not parsing data on the fly, but updating data every week / day
+ - Train & save default model - prophet / arima / vaniall NN
  - Model auto-update with new data
  - Predict when client requests come in
