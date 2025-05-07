@@ -2,7 +2,9 @@
 
 This is a personal project to build the system that systematically parse stock data, train the model, and deploy the app using Streamlit. 
 
-I am focusing on learning ML system architecture, I will not focus on training the accurate model.
+As I am focusing on learning ML system architecture, I will focus on model production than training very accurate model.
+
+Let's use TSLA, AAPL, GOOG.
 
 ## Run Streamlit app
 
