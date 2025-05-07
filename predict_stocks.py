@@ -7,7 +7,7 @@ warnings.filterwarnings('ignore')
 
 from models.prophet import train_prophet_model, forecast_prophet
 from models.arima import train_arima_model, forecast_arima
-from src.utils import fetch_stock_data, mape, tickers
+from src.utils import load_stock_data, tickers
 
 # streamlit app
 def main():
@@ -18,15 +18,12 @@ def main():
     start_date = st.date_input('Start date', value=datetime.now() - timedelta(days=365))
     forecast_days = st.number_input('Forecast days', min_value=1, max_value=90, value=30)
     model_type = st.selectbox('Select model', ['Prophet', 'ARIMA'])
-
-    # default end date to today
-    end_date = datetime.now()
     
     # make prediction
     if st.button('Predict'):
         # fetch stock data
         with st.spinner('Fetching data...'):
-            df, full_name = fetch_stock_data(ticker, start_date, end_date)
+            df = load_stock_data(ticker)
             if df.empty:
                 st.error('No data found for the given ticker and date range. Check the ticker and date range.')
                 return
@@ -55,7 +52,7 @@ def main():
 
         # Display results
         st.subheader('Stock Price Forecast')
-        fig = px.line(df, x='ds', y='y', title=f'{full_name} Stock Price Forecast using {model_type}')
+        fig = px.line(df, x='ds', y='y', title=f'{ticker} Stock Price Forecast using {model_type}')
         fig.add_scatter(x=forecast['ds'], y=forecast['yhat'], mode='lines', name='Forecast')
         if model_type == "Prophet":
             fig.add_scatter(x=forecast['ds'], y=forecast['yhat_lower'], mode='lines', name='Lower Bound', line=dict(dash='dash'))
