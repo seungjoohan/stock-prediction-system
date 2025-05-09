@@ -12,7 +12,9 @@ def train_arima_model(df):
 def forecast_arima(model, df, periods):
     result = model.forecast(steps=periods)
     forecast = pd.DataFrame({'idx': result.index, 'yhat': result.values})
-    forecast['ds'] = forecast['idx'].apply(lambda x: datetime.now() + timedelta(days=x - len(df)))
+    last_date = df['ds'].max()
+    next_date = (last_date + timedelta(days=1)).strftime('%Y-%m-%d')
+    forecast['ds'] = forecast['idx'].apply(lambda x: datetime.strptime(next_date, '%Y-%m-%d') + timedelta(days=x - len(df)))
     forecast['ds'] = pd.to_datetime(forecast['ds']).dt.tz_localize(None)
     return forecast
 
