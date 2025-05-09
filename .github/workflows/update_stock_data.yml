@@ -1,4 +1,4 @@
-name: Update Stock Data
+name: Update Stock Data and Models
 
 on:
   schedule:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  update-data:
+  update-data-and-models:
     runs-on: ubuntu-latest
     
     steps:
@@ -28,9 +28,13 @@ jobs:
       run: |
         python update_stock_data.py
         
+    - name: Run model update script
+      run: |
+        python update_models.py
+        
     - name: Commit and push if changes
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
-        git add data/
-        git diff --quiet && git diff --staged --quiet || (git commit -m "Update stock data" && git push) 
+        git add data/ models/
+        git diff --quiet && git diff --staged --quiet || (git commit -m "Update stock data and models" && git push) 

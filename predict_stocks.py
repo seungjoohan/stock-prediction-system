@@ -5,9 +5,9 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-from models.prophet import train_prophet_model, forecast_prophet
-from models.arima import train_arima_model, forecast_arima
-from src.utils import load_stock_data, tickers
+from models.prophet import load_prophet_model, forecast_prophet
+from models.arima import load_arima_model, forecast_arima
+from src.utils import load_stock_data, tickers, mape
 
 # streamlit app
 def main():
@@ -32,11 +32,11 @@ def main():
             st.session_state.ticker = ticker
             msg = st.success('Data fetched successfully!')
         
-        with st.spinner('Training model...'):
+        with st.spinner('Loading model...'):
             if model_type == "Prophet":
-                st.session_state.model = train_prophet_model(df)
+                st.session_state.model = load_prophet_model(ticker)
             else:
-                st.session_state.model = train_arima_model(df)
+                st.session_state.model = load_arima_model(ticker)
 
             st.session_state.model_type = model_type
             msg.success('Model trained successfully!')

@@ -17,11 +17,11 @@ streamlit run predict_stocks.py
  - Deploying stock prediction app using Streamlit.
  - Generate prediction plots
  - Refresh data every day 
- - Retrain models (ARIMA / Prophet)
+ - Retrain models (ARIMA / Prophet) & save walk forward cross validation results
+ - When asked to predict, the system loads the model instead of training on the fly.
 
 ## TODO
- - Model auto-update
  - Predict when client requests come in
  - Model performance monitoring system
-    * metrics already saved in `artifacts` directory
+    * metrics saved in `artifacts` directory
     * implement hyperparamters tuning when performance insufficient

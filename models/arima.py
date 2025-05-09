@@ -18,9 +18,9 @@ def forecast_arima(model, df, periods):
     forecast['ds'] = pd.to_datetime(forecast['ds']).dt.tz_localize(None)
     return forecast
 
-def save_arima_model(model):
-    model.save(model_artifacts_path + 'arima_model.pkl')
+def save_arima_model(model, ticker):
+    model.save(model_artifacts_path + f'{ticker}_arima_model.pkl')
 
-def load_arima_model():
-    model = ARIMAResults.load(model_artifacts_path + 'arima_model.pkl')
+def load_arima_model(ticker):
+    model = ARIMAResults.load(model_artifacts_path + f'{ticker}_arima_model.pkl')
     return model
