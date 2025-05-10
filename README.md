@@ -16,7 +16,7 @@ streamlit run predict_stocks.py
 
  - Deploying stock prediction app using Streamlit.
  - Generate prediction plots
- - Refresh data every day 
+ - Refresh data every day through yfinance API
  - Retrain models (ARIMA / Prophet) & save walk forward cross validation results
  - When asked to predict, the system loads the model instead of training on the fly.
 
