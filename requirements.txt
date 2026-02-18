@@ -1,3 +1,4 @@
+# Existing
 streamlit
 prophet
 numpy
@@ -5,3 +6,15 @@ pandas
 yfinance
 plotly
 statsmodels
+
+# New — Agentic Trading System
+python-dotenv
+websocket-client
+alpaca-py
+finnhub-python
+fredapi
+feedparser
+groq
+google-genai
+aiohttp
+requests

@@ -6,3 +6,4 @@ models/__pycache__/*
 *.claude
 *.DS_Store
 DESIGN.md
+*.env*
