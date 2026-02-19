@@ -6,8 +6,8 @@ models/__pycache__/*
 *.claude
 *.DS_Store
 DESIGN.md
-*.env*
+*.env
 
 # RAG persistent stores
-db/trading.db*
+db/trading.db
 db/chroma/
