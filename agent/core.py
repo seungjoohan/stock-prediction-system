@@ -22,6 +22,7 @@ from services.trade_executor import TradeExecutor
 from services.portfolio import PortfolioService
 from agent.decision_engine import DecisionEngine
 from agent.risk_manager import RiskManager
+from services.rag_service import RAGService
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,7 @@ class AgentCore:
         self._portfolio = PortfolioService()
         self._decision_engine = DecisionEngine(self._llm)
         self._risk_manager = RiskManager()
+        self._rag = RAGService()
 
         self.recent_sentiment: list[dict] = []
         self._minutes_elapsed = 0
@@ -191,6 +193,12 @@ class AgentCore:
                 "new_signals": len(sentiment_results),
                 "total_retained": len(self.recent_sentiment),
             })
+
+            # Persist to SQL + ChromaDB for cross-session retrieval
+            try:
+                self._rag.index(news_items, sentiment_results)
+            except Exception as rag_exc:
+                logger.warning("RAG indexing failed (non-fatal): %s", rag_exc)
         except Exception as exc:
             logger.warning("Failed to analyze sentiment: %s", exc)
             insert_agent_log("sentiment_analysis_error", str(exc))
@@ -241,6 +249,12 @@ class AgentCore:
                 "initial_jobless_claims": macro_snapshot.initial_jobless_claims,
             }
 
+        historical_context: dict = {}
+        try:
+            historical_context = self._rag.retrieve(list(prices.keys()))
+        except Exception as exc:
+            logger.warning("RAG retrieval failed (non-fatal): %s", exc)
+
         try:
             proposed_trades = self._decision_engine.make_decisions(
                 portfolio_state=portfolio_state_dict,
@@ -248,6 +262,7 @@ class AgentCore:
                 current_prices=prices,
                 fundamentals=fundamentals,
                 macro_snapshot=macro_snapshot_dict,
+                historical_context=historical_context,
             )
             logger.info("Decision engine proposed %d trades", len(proposed_trades))
         except Exception as exc:

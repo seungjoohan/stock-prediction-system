@@ -8,6 +8,7 @@ from datetime import datetime
 import websocket
 
 from config.settings import (
+    FINNHUB_API_KEY,
     FINNHUB_WS_URL,
     TRACKED_SYMBOLS,
     SIGNIFICANT_MOVE_PCT,
@@ -71,6 +72,8 @@ class MarketDataService:
 
     def get_price_change(self, symbol: str, minutes: int) -> float | None:
         """Get price change % over last N minutes. Returns None if insufficient data."""
+        if minutes == 0:
+            return 0.0
         with self._lock:
             history = self.price_history.get(symbol)
             if not history:
@@ -92,8 +95,9 @@ class MarketDataService:
         """Establish WebSocket connection with auto-reconnect."""
         while self._running:
             try:
+                url = f"{FINNHUB_WS_URL}?token={FINNHUB_API_KEY}"
                 self._ws = websocket.WebSocketApp(
-                    FINNHUB_WS_URL,
+                    url,
                     on_message=self._on_message,
                     on_error=self._on_error,
                     on_close=self._on_close,

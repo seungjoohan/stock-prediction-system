@@ -41,7 +41,7 @@ SIGNIFICANT_MOVE_PCT = float(os.getenv("SIGNIFICANT_MOVE_PCT", "0.02"))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.08"))       # force-sell if position down ≥8%
 
 # --- Finnhub WebSocket ---
-FINNHUB_WS_URL = f"wss://ws.finnhub.io?token={FINNHUB_API_KEY}"
+FINNHUB_WS_URL = "wss://ws.finnhub.io"
 
 # --- LLM Settings ---
 # Large model: trading decisions (complex reasoning, low volume, 100k TPD)

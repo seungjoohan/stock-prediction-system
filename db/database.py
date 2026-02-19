@@ -1,7 +1,7 @@
 import json
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from config.settings import DB_PATH
@@ -118,6 +118,22 @@ def init_db() -> None:
                 current_price REAL,
                 updated_at    TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS sentiment_signals (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp       TEXT NOT NULL,
+                ticker          TEXT NOT NULL,
+                sentiment       REAL,
+                confidence      REAL,
+                impact_horizon  TEXT,
+                relevance_score REAL,
+                reasoning       TEXT,
+                news_headline   TEXT,
+                UNIQUE(ticker, news_headline)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sent_sig_ticker_ts
+                ON sentiment_signals(ticker, timestamp);
         """)
 
 
@@ -315,3 +331,34 @@ def is_news_duplicate(headline: str) -> bool:
             "SELECT 1 FROM news_items WHERE headline = ? LIMIT 1", [headline]
         ).fetchone()
         return row is not None
+
+
+def insert_sentiment_signal(signal_dict: dict[str, Any]) -> int:
+    timestamp = signal_dict.get("timestamp") or _now_iso()
+    columns = [
+        "timestamp", "ticker", "sentiment", "confidence",
+        "impact_horizon", "relevance_score", "reasoning", "news_headline",
+    ]
+    values = [timestamp] + [signal_dict.get(col) for col in columns[1:]]
+    sql = (
+        "INSERT OR IGNORE INTO sentiment_signals "
+        "(timestamp, ticker, sentiment, confidence, impact_horizon, "
+        "relevance_score, reasoning, news_headline) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    with _get_connection() as conn:
+        cursor = conn.execute(sql, values)
+        return cursor.lastrowid
+
+
+def get_sentiment_signals(ticker: str, days: int = 7) -> list[dict]:
+    """Return sentiment signals for *ticker* from the last *days* calendar days."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    with _get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM sentiment_signals "
+            "WHERE ticker = ? AND timestamp >= ? "
+            "ORDER BY timestamp DESC",
+            [ticker, cutoff],
+        ).fetchall()
+        return [dict(row) for row in rows]

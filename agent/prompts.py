@@ -101,6 +101,9 @@ Portfolio summary:
 Sentiment signals (from news analysis):
 {sentiment_signals}
 
+Historical context (past sentiment trends and similar news, last 7 days):
+{historical_context}
+
 Price data (recent OHLCV and technical indicators):
 {price_data}
 

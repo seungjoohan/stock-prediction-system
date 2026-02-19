@@ -101,7 +101,9 @@ class TestRiskManagerValidateTrades(unittest.TestCase):
         buy_trade = _make_trade(action="buy", confidence=0.9)
         sell_trade = _make_trade(action="sell", confidence=0.1)
         result = self.rm.validate_trades([buy_trade, sell_trade], portfolio)
-        self.assertEqual(result, [])
+        # Circuit breaker blocks new buys but allows sells (loss-cutting)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].action, "sell")
 
     # Rule 4: VIX circuit breaker (blocks buys only)
     def test_vix_circuit_breaker_blocks_buys(self):
@@ -256,14 +258,15 @@ class TestRiskManagerValidateTrades(unittest.TestCase):
         self.assertEqual(result, [])
 
     def test_daily_counter_resets_on_new_day(self):
-        from datetime import date as _date
+        from datetime import date as _date, timedelta
         self.rm._trades_today = 5
-        yesterday = _date.today().replace(day=max(1, _date.today().day - 1))
+        yesterday = _date.today() - timedelta(days=1)
         self.rm._trade_date = yesterday
         trade = _make_trade(action="sell", confidence=0.9)
         result = self.rm.validate_trades([trade], _base_portfolio())
         self.assertEqual(len(result), 1)
-        self.assertEqual(self.rm._trades_today, 1)
+        # Sells don't increment the buy counter (reset happened + sell approved)
+        self.assertEqual(self.rm._trades_today, 0)
 
 
 if __name__ == "__main__":

@@ -85,8 +85,8 @@ class RiskManager:
                 )
                 continue
 
-            # Rule 3: Max daily loss circuit breaker (blocks all trades)
-            if daily_loss_exceeded:
+            # Rule 3: Max daily loss circuit breaker (blocks new buys only)
+            if not is_sell and daily_loss_exceeded:
                 logger.info(
                     "REJECTED %s %s: daily loss circuit breaker triggered (loss >= %.1f%%)",
                     trade.action,
@@ -163,7 +163,8 @@ class RiskManager:
                 continue
 
             approved.append(trade)
-            self._trades_today += 1
+            if not is_sell:
+                self._trades_today += 1
 
         return approved
 

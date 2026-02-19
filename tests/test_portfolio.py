@@ -142,7 +142,8 @@ class TestPortfolioServiceGetState(unittest.TestCase):
     @patch(f"{_DB_MODULE}.get_positions", return_value=[
         {"ticker": "AAPL", "quantity": 10, "avg_cost": 100.0, "current_price": 110.0}
     ])
-    def test_get_state_computes_total_value(self, mock_positions, mock_snapshot):
+    @patch(f"{_DB_MODULE}.get_day_open_snapshot", return_value={"total_value": 100000.0})
+    def test_get_state_computes_total_value(self, mock_day_open, mock_positions, mock_snapshot):
         from services.portfolio import PortfolioService
         svc = PortfolioService()
         svc.cash = 80000.0
@@ -150,10 +151,13 @@ class TestPortfolioServiceGetState(unittest.TestCase):
         # positions_value = 10 * 150 = 1500; total = 80000 + 1500 = 81500
         self.assertAlmostEqual(state.total_value, 81500.0)
         self.assertAlmostEqual(state.positions_value, 1500.0)
+        # daily_pnl = total_value - day_open total_value = 81500 - 100000 = -18500
+        self.assertAlmostEqual(state.daily_pnl, -18500.0)
 
     @patch(f"{_DB_MODULE}.get_latest_portfolio_snapshot", return_value=None)
     @patch(f"{_DB_MODULE}.get_positions", return_value=[])
-    def test_get_state_no_positions(self, mock_positions, mock_snapshot):
+    @patch(f"{_DB_MODULE}.get_day_open_snapshot", return_value=None)
+    def test_get_state_no_positions(self, mock_day_open, mock_positions, mock_snapshot):
         from services.portfolio import PortfolioService
         svc = PortfolioService()
         svc.cash = 100000.0

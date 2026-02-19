@@ -7,3 +7,7 @@ models/__pycache__/*
 *.DS_Store
 DESIGN.md
 *.env*
+
+# RAG persistent stores
+db/trading.db*
+db/chroma/

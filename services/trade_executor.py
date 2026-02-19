@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 from datetime import datetime, timezone
 
@@ -11,13 +12,16 @@ from db.database import insert_trade, insert_agent_log
 
 logger = logging.getLogger(__name__)
 
+_paper_mode = os.getenv("ALPACA_PAPER_TRADING", "true").lower() == "true"
+
 
 class TradeExecutor:
     def __init__(self):
+        logger.info("Trading mode: %s", "PAPER" if _paper_mode else "LIVE")
         self.client = TradingClient(
             api_key=ALPACA_API_KEY,
             secret_key=ALPACA_SECRET_KEY,
-            paper=True,
+            paper=_paper_mode,
         )
 
     def execute_trade(self, ticker: str, action: str, quantity: int, reasoning: str = "", confidence: float = 0.0) -> dict | None:
@@ -33,7 +37,7 @@ class TradeExecutor:
         else:
             logger.error("Invalid action '%s' for ticker %s", action, ticker)
             insert_agent_log(
-                "TRADE_ERROR",
+                "trade_error",
                 {"ticker": ticker, "action": action, "error": f"Invalid action: {action}"},
                 ticker,
             )
@@ -102,7 +106,7 @@ class TradeExecutor:
 
         if error_message is not None:
             insert_agent_log(
-                "TRADE_ERROR",
+                "trade_error",
                 {"ticker": ticker, "action": action_lower, "quantity": quantity, "error": error_message},
                 ticker,
             )
@@ -119,7 +123,7 @@ class TradeExecutor:
         }
 
         insert_agent_log(
-            "TRADE_EXECUTED",
+            "trade_executed",
             order_dict,
             ticker,
         )
@@ -173,14 +177,14 @@ class TradeExecutor:
                 "action": "sell",
                 "status": str(order.status),
             }
-            insert_agent_log("POSITION_CLOSED", order_dict, ticker)
+            insert_agent_log("position_closed", order_dict, ticker)
             logger.info("Closed position for %s, order_id=%s", ticker, order.id)
             return order_dict
         except Exception as exc:
             error_message = str(exc)
             logger.error("Failed to close position for %s: %s", ticker, error_message)
             insert_agent_log(
-                "POSITION_CLOSE_ERROR",
+                "position_close_error",
                 {"ticker": ticker, "error": error_message},
                 ticker,
             )

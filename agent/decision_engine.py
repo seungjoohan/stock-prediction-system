@@ -20,17 +20,38 @@ _BATCH_SIZE = 5
 
 
 def _extract_json(text: str) -> str:
-    """Strip markdown code fences and extract the first JSON array or object."""
+    """Strip markdown code fences and extract the first balanced JSON array or object."""
     text = text.strip()
     fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if fenced:
         return fenced.group(1).strip()
-    start = text.find("[")
-    if start != -1:
-        return text[start:]
-    start = text.find("{")
-    if start != -1:
-        return text[start:]
+    # Use bracket matching to find the balanced end, ignoring trailing garbage
+    for open_char, close_char in [("[", "]"), ("{", "}")]:
+        start = text.find(open_char)
+        if start == -1:
+            continue
+        depth = 0
+        in_string = False
+        escape_next = False
+        for i, ch in enumerate(text[start:], start):
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == "\\" and in_string:
+                escape_next = True
+                continue
+            if ch == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == open_char:
+                depth += 1
+            elif ch == close_char:
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+        # If we get here, brackets were unbalanced — fall through to next pattern
     return text
 
 
@@ -102,9 +123,16 @@ def _format_sentiment_signals(sentiment_signals: list[dict]) -> str:
         horizon = sig.get("impact_horizon", "unknown")
         relevance = sig.get("relevance_score", 0.0)
         reasoning = sig.get("reasoning", "")
+        timestamp = sig.get("timestamp", "")
+        if timestamp:
+            # Extract HH:MM from ISO-8601 string (e.g. "2026-02-18T14:35:00Z" -> "14:35 UTC")
+            time_part = str(timestamp)[11:16]
+            at_str = f" at={time_part} UTC" if time_part else ""
+        else:
+            at_str = ""
         lines.append(
             f"- {ticker}: sentiment={sentiment:+.2f}, confidence={confidence:.2f}, "
-            f"horizon={horizon}, relevance={relevance:.2f} — {reasoning}"
+            f"horizon={horizon}, relevance={relevance:.2f}{at_str} — {reasoning}"
         )
     return "\n".join(lines)
 
@@ -211,6 +239,64 @@ def _format_macro_summary(macro_snapshot: dict | None) -> str:
     return "\n".join(lines)
 
 
+def _format_historical_context(ctx: dict | None) -> str:
+    """Format RAG-retrieved historical context for injection into the decision prompt.
+
+    Includes all tickers that have data. Per-ticker output is kept concise
+    (1-2 lines) so total prompt size remains manageable.
+    """
+    if not ctx:
+        return "No historical context available."
+
+    lines: list[str] = []
+    for ticker, data in ctx.items():
+        recent_signals: list[dict] = data.get("recent_signals", [])
+        similar_news: list[dict] = data.get("similar_news", [])
+
+        if not recent_signals and not similar_news:
+            continue
+
+        lines.append(f"{ticker} (last 7 days):")
+
+        # Aggregate sentiment trend from SQL signals
+        if recent_signals:
+            sentiments = [s.get("sentiment", 0.0) for s in recent_signals if s.get("sentiment") is not None]
+            if sentiments:
+                avg_sentiment = sum(sentiments) / len(sentiments)
+                if avg_sentiment > 0.3:
+                    label = "bullish"
+                elif avg_sentiment > 0.1:
+                    label = "moderately bullish"
+                elif avg_sentiment < -0.3:
+                    label = "bearish"
+                elif avg_sentiment < -0.1:
+                    label = "moderately bearish"
+                else:
+                    label = "neutral"
+                lines.append(
+                    f"  Sentiment trend: {len(sentiments)} signal(s) avg {avg_sentiment:+.2f} — {label}"
+                )
+
+        # Top similar past news from ChromaDB
+        if similar_news:
+            lines.append("  Similar past news:")
+            for item in similar_news[:3]:
+                ts = item.get("timestamp", "")[:10]  # YYYY-MM-DD
+                text = item.get("text", "")
+                # Truncate long texts
+                if len(text) > 100:
+                    text = text[:97] + "..."
+                sentiment = item.get("sentiment")
+                if sentiment is not None:
+                    lines.append(f'    [{ts}] "{text}" (sentiment {sentiment:+.2f})')
+                else:
+                    lines.append(f'    [{ts}] "{text}"')
+
+    if not lines:
+        return "No historical context available."
+    return "\n".join(lines)
+
+
 class DecisionEngine:
     def __init__(self, llm: LLMProvider) -> None:
         self._llm = llm
@@ -276,6 +362,7 @@ class DecisionEngine:
         current_prices: dict[str, float],
         fundamentals: dict[str, dict],
         macro_snapshot: dict | None,
+        historical_context: dict | None = None,
     ) -> list[TradeAction]:
         """Build context summaries, call LLM with decision prompt, parse JSON
         response into TradeAction objects."""
@@ -284,10 +371,12 @@ class DecisionEngine:
         price_text = _format_price_data(current_prices)
         fundamentals_text = _format_fundamentals(fundamentals)
         macro_text = _format_macro_summary(macro_snapshot)
+        historical_text = _format_historical_context(historical_context)
 
         prompt = DECISION_USER_PROMPT.format(
             portfolio_summary=portfolio_summary,
             sentiment_signals=sentiment_text,
+            historical_context=historical_text,
             price_data=price_text,
             fundamentals_summary=fundamentals_text,
             macro_summary=macro_text,

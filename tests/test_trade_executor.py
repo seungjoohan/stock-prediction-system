@@ -121,7 +121,7 @@ class TestTradeExecutorExecuteTrade(unittest.TestCase):
         # insert_agent_log should be called with TRADE_ERROR event
         error_calls = [
             call for call in mock_log.call_args_list
-            if call.args and call.args[0] == "TRADE_ERROR"
+            if call.args and call.args[0] == "trade_error"
         ]
         self.assertTrue(len(error_calls) > 0)
 
@@ -152,7 +152,7 @@ class TestTradeExecutorExecuteTrade(unittest.TestCase):
 
         success_calls = [
             call for call in mock_log.call_args_list
-            if call.args and call.args[0] == "TRADE_EXECUTED"
+            if call.args and call.args[0] == "trade_executed"
         ]
         self.assertTrue(len(success_calls) > 0)
 
