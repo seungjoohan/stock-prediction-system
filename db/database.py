@@ -134,6 +134,12 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_sent_sig_ticker_ts
                 ON sentiment_signals(ticker, timestamp);
+
+            CREATE TABLE IF NOT EXISTS live_prices (
+                ticker     TEXT PRIMARY KEY,
+                price      REAL NOT NULL,
+                updated_at TEXT NOT NULL
+            );
         """)
 
 
@@ -331,6 +337,27 @@ def is_news_duplicate(headline: str) -> bool:
             "SELECT 1 FROM news_items WHERE headline = ? LIMIT 1", [headline]
         ).fetchone()
         return row is not None
+
+
+def upsert_live_prices(prices: dict[str, float]) -> None:
+    """Batch-upsert WebSocket prices into the live_prices table."""
+    if not prices:
+        return
+    now = _now_iso()
+    rows = [(ticker, price, now) for ticker, price in prices.items() if price]
+    sql = (
+        "INSERT INTO live_prices (ticker, price, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(ticker) DO UPDATE SET price = excluded.price, updated_at = excluded.updated_at"
+    )
+    with _get_connection() as conn:
+        conn.executemany(sql, rows)
+
+
+def get_live_prices() -> dict[str, float]:
+    """Return all live prices as a ticker->price dict."""
+    with _get_connection() as conn:
+        rows = conn.execute("SELECT ticker, price FROM live_prices").fetchall()
+        return {row["ticker"]: row["price"] for row in rows}
 
 
 def insert_sentiment_signal(signal_dict: dict[str, Any]) -> int:

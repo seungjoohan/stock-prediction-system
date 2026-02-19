@@ -1,4 +1,5 @@
 import logging
+import threading
 import time
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
@@ -12,7 +13,7 @@ from config.settings import (
     MARKET_CLOSE_HOUR,
     MARKET_CLOSE_MINUTE,
 )
-from db.database import init_db, insert_agent_log, get_company_fundamentals
+from db.database import init_db, insert_agent_log, get_company_fundamentals, upsert_live_prices
 from services.market_data import MarketDataService
 from services.news_ingestion import fetch_latest_news
 from services.fundamentals import FundamentalsService
@@ -47,6 +48,8 @@ class AgentCore:
         self.recent_sentiment: list[dict] = []
         self._minutes_elapsed = 0
         self._last_setup_date: date | None = None
+        self._price_flush_running = False
+        self._price_flush_thread: threading.Thread | None = None
 
         self._market_data.on_significant_move(self._on_significant_move)
 
@@ -59,6 +62,7 @@ class AgentCore:
         except KeyboardInterrupt:
             logger.info("Shutdown requested via KeyboardInterrupt")
         finally:
+            self._price_flush_running = False
             self._market_data.stop()
             logger.info("Market data service stopped; agent exiting")
 
@@ -110,9 +114,34 @@ class AgentCore:
             self._market_data.start()
             logger.info("Market data WebSocket started")
             insert_agent_log("market_data_start", "WebSocket connection established")
+            self._start_price_flush_thread()
         except Exception as exc:
             logger.warning("Failed to start market data WebSocket: %s", exc)
             insert_agent_log("market_data_start_error", str(exc))
+
+    def _start_price_flush_thread(self):
+        """Flush in-memory WebSocket prices to SQLite every 5 seconds so the dashboard stays current."""
+        if self._price_flush_thread and self._price_flush_thread.is_alive():
+            return
+
+        def _flush_loop():
+            while self._price_flush_running:
+                try:
+                    prices = self._market_data.get_all_prices()
+                    if prices:
+                        upsert_live_prices(prices)
+                except Exception as exc:
+                    logger.debug("Price flush error (non-fatal): %s", exc)
+                time.sleep(5)
+
+        self._price_flush_running = True
+        self._price_flush_thread = threading.Thread(
+            target=_flush_loop,
+            name="price-flush",
+            daemon=True,
+        )
+        self._price_flush_thread.start()
+        logger.info("Price flush thread started (interval=5s)")
 
     def _market_loop(self):
         logger.info("Entering market loop")

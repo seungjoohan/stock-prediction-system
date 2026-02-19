@@ -31,6 +31,8 @@ class PortfolioService:
     def __init__(self):
         self.realized_pnl = 0.0
         self.buying_power = 0.0
+        self._alpaca_unrealized = 0.0
+        self.equity = INITIAL_CAPITAL
         self._load_state()
 
     def _load_state(self):
@@ -184,6 +186,8 @@ class PortfolioService:
         equity = float(account.get("equity", self.cash))
         total_unrealized = sum(float(p.get("unrealized_pl", 0)) for p in alpaca_positions)
         self.realized_pnl = equity - INITIAL_CAPITAL - total_unrealized
+        self._alpaca_unrealized = total_unrealized
+        self.equity = equity
 
         # Sync positions table: upsert from Alpaca, remove positions no longer held
         existing_tickers = {p["ticker"] for p in get_positions()}
@@ -214,7 +218,7 @@ class PortfolioService:
             "cash": state.cash,
             "positions_value": state.positions_value,
             "realized_pnl": state.realized_pnl,
-            "unrealized_pnl": state.unrealized_pnl,
+            "unrealized_pnl": self._alpaca_unrealized,
             "daily_pnl": state.daily_pnl,
         })
         logger.info(
@@ -223,5 +227,5 @@ class PortfolioService:
             state.total_value,
             state.cash,
             state.positions_value,
-            state.unrealized_pnl,
+            self._alpaca_unrealized,
         )

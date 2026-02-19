@@ -107,38 +107,65 @@ class RiskManager:
                     )
                     continue
 
-            # Rule 5: Cash reserve check (buys only) — use buying_power (Alpaca margin-safe)
+            # Rule 5+6: Trim buy quantity to fit within cash reserve AND position size limits
             if not is_sell:
                 total_value = portfolio_state.get("total_value", 0)
                 buying_power = portfolio_state.get(
                     "buying_power", portfolio_state.get("cash", 0)
                 )
-                required_reserve = total_value * CASH_RESERVE_PCT
                 price = (
                     (current_prices or {}).get(trade.ticker)
                     or self._get_current_price(trade.ticker, portfolio_state)
                 )
-                position_cost = trade.quantity * price
-                if buying_power - position_cost < required_reserve:
-                    logger.info(
-                        "REJECTED buy %s: insufficient buying power after %.1f%% reserve "
-                        "(buying_power=%.2f, cost=%.2f, reserve=%.2f)",
-                        trade.ticker,
-                        CASH_RESERVE_PCT * 100,
-                        buying_power,
-                        position_cost,
-                        required_reserve,
-                    )
-                    continue
+                if price and price > 0:
+                    # Max quantity by cash reserve: keep CASH_RESERVE_PCT of total_value in cash
+                    required_reserve = total_value * CASH_RESERVE_PCT
+                    available_to_spend = max(0.0, buying_power - required_reserve)
+                    max_qty_by_cash = int(available_to_spend / price)
 
-            # Rule 6: Max position size check (buys only)
-            if not is_sell and self._check_position_size(trade, portfolio_state, current_prices):
-                logger.info(
-                    "REJECTED buy %s: would exceed max position size %.1f%% of portfolio",
-                    trade.ticker,
-                    MAX_POSITION_PCT * 100,
-                )
-                continue
+                    # Max quantity by position size: single ticker <= MAX_POSITION_PCT of total_value
+                    existing_value = 0.0
+                    for pos in portfolio_state.get("positions", []):
+                        if pos.get("ticker") == trade.ticker:
+                            existing_value = pos.get("quantity", 0) * (
+                                pos.get("current_price") or pos.get("avg_cost") or price
+                            )
+                            break
+                    max_position_value = total_value * MAX_POSITION_PCT
+                    room_remaining = max(0.0, max_position_value - existing_value)
+                    max_qty_by_position = int(room_remaining / price)
+
+                    # Final quantity: minimum of requested, cash limit, and position limit
+                    final_qty = min(trade.quantity, max_qty_by_cash, max_qty_by_position)
+
+                    if final_qty <= 0:
+                        if max_qty_by_position <= 0:
+                            logger.info(
+                                "REJECTED buy %s: already at max position size %.1f%% of portfolio",
+                                trade.ticker, MAX_POSITION_PCT * 100,
+                            )
+                        else:
+                            logger.info(
+                                "REJECTED buy %s: insufficient buying power after %.1f%% reserve "
+                                "(buying_power=%.2f, reserve=%.2f)",
+                                trade.ticker, CASH_RESERVE_PCT * 100, buying_power, required_reserve,
+                            )
+                        continue
+
+                    if final_qty < trade.quantity:
+                        logger.info(
+                            "TRIMMED buy %s: quantity %d → %d (cash_limit=%d, position_limit=%d)",
+                            trade.ticker, trade.quantity, final_qty, max_qty_by_cash, max_qty_by_position,
+                        )
+                        trade = TradeAction(
+                            ticker=trade.ticker,
+                            action=trade.action,
+                            quantity=final_qty,
+                            reasoning=trade.reasoning,
+                            confidence=trade.confidence,
+                            urgency=trade.urgency,
+                        )
+                # If price is unknown, skip size/cash enforcement and proceed to Rule 7+8
 
             # Rule 7: Concentration limit — max positions for new buys
             if not is_sell:
@@ -176,29 +203,6 @@ class RiskManager:
             return False
         loss_pct = -daily_pnl / total_value
         return loss_pct >= MAX_DAILY_LOSS_PCT
-
-    def _check_position_size(
-        self, trade: TradeAction, portfolio_state: dict, current_prices: dict | None = None
-    ) -> bool:
-        """Return True if trade would exceed max position size."""
-        total_value = portfolio_state.get("total_value", 0)
-        if total_value <= 0:
-            return False
-
-        current_price = (
-            (current_prices or {}).get(trade.ticker)
-            or self._get_current_price(trade.ticker, portfolio_state)
-        )
-        new_cost = trade.quantity * current_price
-
-        existing_value = 0.0
-        for pos in portfolio_state.get("positions", []):
-            if pos.get("ticker") == trade.ticker:
-                existing_value = pos.get("quantity", 0) * pos.get("current_price", 0)
-                break
-
-        projected_position_value = existing_value + new_cost
-        return projected_position_value / total_value > MAX_POSITION_PCT
 
     def _check_earnings_blackout(self, ticker: str, fundamentals: dict | None) -> bool:
         """Return True if ticker is within earnings blackout period."""

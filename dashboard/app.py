@@ -61,6 +61,20 @@ def fetch_positions() -> pd.DataFrame:
         return pd.DataFrame()
 
 
+@st.cache_data(ttl=5)
+def fetch_live_prices() -> pd.DataFrame:
+    """Fetch real-time prices written by the agent's WebSocket flush thread (updated every 5s)."""
+    try:
+        with get_db_connection() as conn:
+            df = pd.read_sql_query(
+                "SELECT ticker, price AS live_price, updated_at AS price_updated_at FROM live_prices",
+                conn,
+            )
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
 @st.cache_data(ttl=30)
 def fetch_trades(ticker_filter: str | None = None) -> pd.DataFrame:
     try:
@@ -310,16 +324,33 @@ elif page == "Positions":
     st.title("Current Positions")
 
     positions_df = fetch_positions()
+    live_prices_df = fetch_live_prices()
     snapshot = fetch_latest_snapshot()
 
     if positions_df.empty:
         st.info("No open positions.")
     else:
         df = positions_df.copy()
-        df["market_value"] = df["current_price"] * df["quantity"]
-        df["unrealized_pnl"] = (df["current_price"] - df["avg_cost"]) * df["quantity"]
+
+        # Merge live WebSocket prices; fall back to Alpaca-synced current_price
+        if not live_prices_df.empty:
+            df = df.merge(live_prices_df[["ticker", "live_price", "price_updated_at"]],
+                          on="ticker", how="left")
+        else:
+            df["live_price"] = None
+            df["price_updated_at"] = None
+
+        # Coalesce: live WebSocket price → Alpaca-synced price → avg_cost
+        df["effective_price"] = (
+            df["live_price"]
+            .fillna(df["current_price"])
+            .fillna(df["avg_cost"])
+        )
+
+        df["market_value"] = df["effective_price"] * df["quantity"]
+        df["unrealized_pnl"] = (df["effective_price"] - df["avg_cost"]) * df["quantity"]
         df["unrealized_pnl_pct"] = (
-            (df["current_price"] - df["avg_cost"]) / df["avg_cost"] * 100
+            (df["effective_price"] - df["avg_cost"]) / df["avg_cost"] * 100
         )
 
         display_df = df[
@@ -327,7 +358,7 @@ elif page == "Positions":
                 "ticker",
                 "quantity",
                 "avg_cost",
-                "current_price",
+                "effective_price",
                 "market_value",
                 "unrealized_pnl",
                 "unrealized_pnl_pct",
@@ -340,13 +371,32 @@ elif page == "Positions":
                 "ticker": "Ticker",
                 "quantity": "Quantity",
                 "avg_cost": "Avg Cost",
-                "current_price": "Current Price",
+                "effective_price": "Current Price",
                 "market_value": "Market Value",
                 "unrealized_pnl": "Unrealized P&L",
                 "unrealized_pnl_pct": "Unrealized P&L %",
-                "updated_at": "Updated At",
+                "updated_at": "Last Synced",
             }
         )
+
+        # Totals row
+        total_cost_basis = (df["avg_cost"] * df["quantity"]).sum()
+        total_market_value = df["market_value"].sum()
+        total_unrealized_pnl = df["unrealized_pnl"].sum()
+        total_unrealized_pnl_pct = (
+            (total_unrealized_pnl / total_cost_basis * 100) if total_cost_basis else 0.0
+        )
+        total_row = pd.DataFrame([{
+            "Ticker": "TOTAL",
+            "Quantity": float("nan"),
+            "Avg Cost": float("nan"),
+            "Current Price": float("nan"),
+            "Market Value": total_market_value,
+            "Unrealized P&L": total_unrealized_pnl,
+            "Unrealized P&L %": total_unrealized_pnl_pct,
+            "Last Synced": "",
+        }])
+        display_df = pd.concat([display_df, total_row], ignore_index=True)
 
         format_map = {
             "Avg Cost": "${:,.2f}",
@@ -357,6 +407,13 @@ elif page == "Positions":
         }
         styled = display_df.style.format(format_map, na_rep="N/A")
         st.dataframe(styled, use_container_width=True)
+
+        # Price source indicator
+        if not live_prices_df.empty and df["live_price"].notna().any():
+            freshest = df["price_updated_at"].dropna().max()
+            st.caption(f"Prices: Finnhub WebSocket  |  Last updated: {str(freshest)[:19]} UTC")
+        else:
+            st.caption("Prices: Alpaca sync (live prices not yet available — agent may not be running)")
 
         st.markdown("---")
         st.subheader("Position Allocation")

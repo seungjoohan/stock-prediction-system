@@ -84,7 +84,8 @@ class TestRiskManagerValidateTrades(unittest.TestCase):
 
     # Rule 2: Max trades per day (buys only)
     def test_max_trades_per_day_blocks_buys(self):
-        self.rm._trades_today = 10
+        from config.settings import MAX_TRADES_PER_DAY
+        self.rm._trades_today = MAX_TRADES_PER_DAY
         trade = _make_trade(action="buy", confidence=0.9)
         result = self.rm.validate_trades([trade], _base_portfolio())
         self.assertEqual(result, [])
@@ -131,11 +132,9 @@ class TestRiskManagerValidateTrades(unittest.TestCase):
 
     # Rule 5: Cash reserve check (buys only)
     def test_cash_reserve_check(self):
-        # 10 shares at $150 = $1500 cost; cash=10500, total=100000
-        # reserve required = 100000 * 0.10 = 10000
-        # cash after buy = 10500 - 1500 = 9000 < 10000 → rejected
+        # cash=4000, total=100000; reserve=5000 (5%); available=max(0,4000-5000)=0 → rejected
         portfolio = _base_portfolio(
-            cash=10500.0,
+            cash=4000.0,
             total_value=100000.0,
             positions=[
                 {"ticker": "AAPL", "quantity": 0, "current_price": 150.0, "avg_cost": 0.0}
@@ -144,6 +143,21 @@ class TestRiskManagerValidateTrades(unittest.TestCase):
         trade = _make_trade(ticker="AAPL", action="buy", quantity=10, confidence=0.9)
         result = self.rm.validate_trades([trade], portfolio)
         self.assertEqual(result, [])
+
+    def test_cash_reserve_trims_buy_quantity(self):
+        # cash=6000, total=100000; reserve=5000 (5%); available=1000; price=150 → max_qty=6
+        # trade requests 10 → trimmed to 6
+        portfolio = _base_portfolio(
+            cash=6000.0,
+            total_value=100000.0,
+            positions=[
+                {"ticker": "AAPL", "quantity": 0, "current_price": 150.0, "avg_cost": 0.0}
+            ],
+        )
+        trade = _make_trade(ticker="AAPL", action="buy", quantity=10, confidence=0.9)
+        result = self.rm.validate_trades([trade], portfolio)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].quantity, 6)
 
     def test_cash_reserve_sufficient_allows_buy(self):
         # 1 share at $10 = $10 cost; cash=20000, total=100000
@@ -159,10 +173,12 @@ class TestRiskManagerValidateTrades(unittest.TestCase):
         result = self.rm.validate_trades([trade], portfolio)
         self.assertEqual(len(result), 1)
 
-    # Rule 6: Max position size (buys only)
+    # Rule 6: Max position size (buys only) — trims quantity instead of rejecting
     def test_max_position_size(self):
-        # total_value=100000; buy 200 shares at $110 = $22000 new cost
-        # existing position 0 shares → projected = 22000 / 100000 = 22% > 20% → rejected
+        # total_value=100000; buy 350 shares at $110 = $38500 (38.5% > 30%)
+        # max_qty_by_position = floor(100000 * 0.30 / 110) = 272
+        # cash=90000 → available=85000 → max_qty_by_cash=772 (not limiting)
+        # final_qty = min(350, 772, 272) = 272 → trimmed
         portfolio = _base_portfolio(
             cash=90000.0,
             total_value=100000.0,
@@ -170,7 +186,21 @@ class TestRiskManagerValidateTrades(unittest.TestCase):
                 {"ticker": "AAPL", "quantity": 0, "current_price": 110.0, "avg_cost": 0.0}
             ],
         )
-        trade = _make_trade(ticker="AAPL", action="buy", quantity=200, confidence=0.9)
+        trade = _make_trade(ticker="AAPL", action="buy", quantity=350, confidence=0.9)
+        result = self.rm.validate_trades([trade], portfolio)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].quantity, 272)  # floor(100000 * 0.30 / 110)
+
+    def test_max_position_size_fully_at_cap_rejected(self):
+        # Existing position already at 30% cap → room=0 → rejected
+        portfolio = _base_portfolio(
+            cash=70000.0,
+            total_value=100000.0,
+            positions=[
+                {"ticker": "AAPL", "quantity": 273, "current_price": 110.0, "avg_cost": 110.0}
+            ],
+        )
+        trade = _make_trade(ticker="AAPL", action="buy", quantity=10, confidence=0.9)
         result = self.rm.validate_trades([trade], portfolio)
         self.assertEqual(result, [])
 
