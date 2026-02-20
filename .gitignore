@@ -9,5 +9,4 @@ DESIGN.md
 *.env
 
 # RAG persistent stores
-db/trading.db
-db/chroma/
+db/*
