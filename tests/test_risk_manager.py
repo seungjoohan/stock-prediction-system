@@ -219,9 +219,10 @@ class TestRiskManagerValidateTrades(unittest.TestCase):
 
     # Rule 7: Concentration limit
     def test_concentration_limit(self):
+        from config.settings import MAX_POSITIONS
         positions = [
             {"ticker": f"TICK{i}", "quantity": 1, "current_price": 100.0, "avg_cost": 100.0}
-            for i in range(10)
+            for i in range(MAX_POSITIONS)
         ]
         portfolio = _base_portfolio(
             cash=90000.0,
@@ -233,9 +234,10 @@ class TestRiskManagerValidateTrades(unittest.TestCase):
         self.assertEqual(result, [])
 
     def test_concentration_limit_existing_ticker_allowed(self):
+        from config.settings import MAX_POSITIONS
         positions = [
             {"ticker": f"TICK{i}", "quantity": 1, "current_price": 100.0, "avg_cost": 100.0}
-            for i in range(10)
+            for i in range(MAX_POSITIONS)
         ]
         portfolio = _base_portfolio(
             cash=90000.0,

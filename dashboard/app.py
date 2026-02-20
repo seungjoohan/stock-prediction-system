@@ -3,6 +3,8 @@ import os
 import sqlite3
 import sys
 import time
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.express as px
@@ -13,6 +15,23 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config.settings import DB_PATH, INITIAL_CAPITAL
 
 st.set_page_config(page_title="Trading Agent Dashboard", layout="wide")
+
+_ET = ZoneInfo("America/New_York")
+
+
+def _to_et(ts_str, date_only: bool = False) -> str:
+    """Convert a UTC ISO timestamp string to Eastern Time for display."""
+    s = str(ts_str).strip() if ts_str else ""
+    if not s:
+        return ""
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        et = dt.astimezone(_ET)
+        return et.strftime("%Y-%m-%d" if date_only else "%Y-%m-%d %H:%M ET")
+    except (ValueError, TypeError):
+        return s
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -42,7 +61,7 @@ def fetch_portfolio_history() -> pd.DataFrame:
                 "FROM portfolio_snapshots ORDER BY timestamp ASC",
                 conn,
             )
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert("America/New_York")
         return df
     except Exception:
         return pd.DataFrame()
@@ -59,6 +78,28 @@ def fetch_positions() -> pd.DataFrame:
         return df
     except Exception:
         return pd.DataFrame()
+
+
+@st.cache_data(ttl=300)
+def fetch_day_open_snapshot() -> dict | None:
+    """First snapshot of today, used as the daily P&L baseline."""
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        with get_db_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM portfolio_snapshots WHERE timestamp >= ? ORDER BY timestamp ASC LIMIT 1",
+                [today_str],
+            ).fetchone()
+            if row:
+                return dict(row)
+            # Fallback: last snapshot before today (previous close)
+            row = conn.execute(
+                "SELECT * FROM portfolio_snapshots WHERE timestamp < ? ORDER BY timestamp DESC LIMIT 1",
+                [today_str],
+            ).fetchone()
+            return dict(row) if row else None
+    except Exception:
+        return None
 
 
 @st.cache_data(ttl=5)
@@ -251,17 +292,47 @@ if page == "Portfolio Overview":
     """, unsafe_allow_html=True)
 
     snapshot = fetch_latest_snapshot()
+    _live_prices_ov = fetch_live_prices()
+    _positions_ov = fetch_positions()
+    _day_open = fetch_day_open_snapshot()
 
     col1, col2, col3, col4, col5 = st.columns(5)
     if snapshot:
-        total_value = snapshot.get("total_value") or 0.0
-        positions_value = snapshot.get("positions_value") or 0.0
+        # Cash only changes on trades — read from snapshot
         cash = snapshot.get("cash") or 0.0
-        daily_pnl = snapshot.get("daily_pnl") or 0.0
-        realized_pnl = snapshot.get("realized_pnl") or 0.0
-        unrealized_pnl = snapshot.get("unrealized_pnl") or 0.0
 
-        cost_basis = positions_value - unrealized_pnl
+        # Compute positions metrics live from WebSocket prices + DB quantities/avg_cost
+        if not _positions_ov.empty:
+            _pos = _positions_ov.copy()
+            if not _live_prices_ov.empty:
+                _pos = _pos.merge(_live_prices_ov[["ticker", "live_price"]], on="ticker", how="left")
+            else:
+                _pos["live_price"] = None
+            _pos["effective_price"] = (
+                _pos["live_price"]
+                .fillna(_pos["current_price"])
+                .fillna(_pos["avg_cost"])
+            )
+            positions_value = (_pos["effective_price"] * _pos["quantity"]).sum()
+            cost_basis = (_pos["avg_cost"] * _pos["quantity"]).sum()
+            unrealized_pnl = positions_value - cost_basis
+        else:
+            positions_value = 0.0
+            cost_basis = 0.0
+            unrealized_pnl = 0.0
+
+        total_value = cash + positions_value
+
+        # Realized P&L from accounting identity — consistent with all live data:
+        # total_gain = realized + unrealized  →  realized = total_gain - unrealized
+        # = (cash + cost_basis) - INITIAL_CAPITAL
+        realized_pnl = total_value - INITIAL_CAPITAL - unrealized_pnl
+
+        # Today's P&L: live total vs day-open snapshot total
+        if _day_open:
+            daily_pnl = total_value - (_day_open.get("total_value") or total_value)
+        else:
+            daily_pnl = snapshot.get("daily_pnl") or 0.0
 
         col1.metric("Total Value", f"${total_value:,.2f}")
         col2.metric(
@@ -281,6 +352,12 @@ if page == "Portfolio Overview":
             f"${realized_pnl:,.2f}",
             delta=f"{realized_pnl / total_value * 100:+.2f}%" if total_value else None,
         )
+
+        if not _live_prices_ov.empty:
+            freshest = _live_prices_ov["price_updated_at"].max()
+            st.caption(f"Prices: Finnhub WebSocket  |  Last updated: {_to_et(freshest)}")
+        else:
+            st.caption("Prices: Alpaca sync (live prices not yet available — agent may not be running)")
     else:
         for col in [col1, col2, col3, col4, col5]:
             col.metric("—", "No data")
@@ -317,6 +394,53 @@ if page == "Portfolio Overview":
             margin=dict(l=0, r=0, t=20, b=0),
         )
         st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("Estimated Tax Liability")
+
+    if not snapshot:
+        st.info("No snapshot data available.")
+    else:
+        taxable_realized = max(0.0, realized_pnl)
+        taxable_unrealized = max(0.0, unrealized_pnl)
+
+        st.caption(
+            "Federal short-term rates only (active trading is typically held < 1 year). "
+            "Does not include state taxes, the 3.8% NIIT, or other income. "
+            "Consult a tax professional for actual liability."
+        )
+
+        brackets = [
+            ("10%", 0.10),
+            ("12%", 0.12),
+            ("22%", 0.22),
+            ("24%", 0.24),
+            ("32%", 0.32),
+            ("35%", 0.35),
+            ("37%", 0.37),
+        ]
+
+        rows = []
+        for rate_label, rate in brackets:
+            accrued = taxable_realized * rate
+            deferred = taxable_unrealized * rate
+            total_exposure = accrued + deferred
+            after_tax_value = total_value - accrued
+            rows.append({
+                "Bracket": rate_label,
+                "Accrued (Realized)": f"${accrued:,.2f}",
+                "Deferred (Unrealized)": f"${deferred:,.2f}",
+                "Total Exposure": f"${total_exposure:,.2f}",
+                "After-Tax Portfolio": f"${after_tax_value:,.2f}",
+            })
+
+        st.table(pd.DataFrame(rows))
+        st.caption(
+            f"**Accrued** = tax owed now on closed trades (realized P&L: **${realized_pnl:,.2f}**)  |  "
+            f"**Deferred** = additional tax if you sold all open positions today "
+            f"(unrealized P&L: **${unrealized_pnl:,.2f}**)  |  "
+            f"**After-Tax Portfolio** = current total value minus accrued tax only"
+        )
 
 
 # --- Page: Positions ---
@@ -378,6 +502,7 @@ elif page == "Positions":
                 "updated_at": "Last Synced",
             }
         )
+        display_df["Last Synced"] = display_df["Last Synced"].apply(_to_et)
 
         # Totals row
         total_cost_basis = (df["avg_cost"] * df["quantity"]).sum()
@@ -411,7 +536,7 @@ elif page == "Positions":
         # Price source indicator
         if not live_prices_df.empty and df["live_price"].notna().any():
             freshest = df["price_updated_at"].dropna().max()
-            st.caption(f"Prices: Finnhub WebSocket  |  Last updated: {str(freshest)[:19]} UTC")
+            st.caption(f"Prices: Finnhub WebSocket  |  Last updated: {_to_et(freshest)}")
         else:
             st.caption("Prices: Alpaca sync (live prices not yet available — agent may not be running)")
 
@@ -469,7 +594,7 @@ elif page == "Trade History":
             )
             col3.markdown(f"Qty: {row.get('quantity', 0):.2f}")
             col4.markdown(f"${row.get('price', 0):,.2f}")
-            col5.markdown(str(row.get("timestamp", ""))[:19])
+            col5.markdown(_to_et(row.get("timestamp", "")))
 
             reasoning = row.get("reasoning") or ""
             confidence = row.get("confidence")
@@ -509,7 +634,7 @@ elif page == "Fundamentals & Macro":
         if not macro:
             st.info("No macro data yet.")
         else:
-            st.caption(f"Last updated: {str(macro.get('timestamp', ''))[:19]}")
+            st.caption(f"Last updated: {_to_et(macro.get('timestamp', ''))}")
 
             col1, col2, col3 = st.columns(3)
             fed_rate = macro.get("fed_funds_rate")
@@ -621,7 +746,7 @@ elif page == "Agent Activity":
         st.subheader(f"Recent Logs ({len(filtered_df)} shown)")
 
         for _, row in filtered_df.iterrows():
-            ts = str(row.get("timestamp", ""))[:19]
+            ts = _to_et(row.get("timestamp", ""))
             event_type = row.get("event_type", "")
             ticker = row.get("related_ticker") or ""
             content_raw = row.get("content") or ""
@@ -663,13 +788,13 @@ elif page == "Performance Analytics":
 
     if best:
         col5.metric(
-            f"Best Trade ({best['ticker']} @ {str(best['timestamp'])[:10]})",
+            f"Best Trade ({best['ticker']} @ {_to_et(best['timestamp'], date_only=True)})",
             f"${best['pnl']:,.2f}",
         )
 
     if worst:
         st.metric(
-            f"Worst Trade ({worst['ticker']} @ {str(worst['timestamp'])[:10]})",
+            f"Worst Trade ({worst['ticker']} @ {_to_et(worst['timestamp'], date_only=True)})",
             f"${worst['pnl']:,.2f}",
         )
 
