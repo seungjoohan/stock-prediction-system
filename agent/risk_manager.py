@@ -110,9 +110,10 @@ class RiskManager:
             # Rule 5+6: Trim buy quantity to fit within cash reserve AND position size limits
             if not is_sell:
                 total_value = portfolio_state.get("total_value", 0)
-                buying_power = portfolio_state.get(
-                    "buying_power", portfolio_state.get("cash", 0)
-                )
+                # Use actual cash, not buying_power — buying_power can include Alpaca margin
+                # (2× cash on margin accounts), which would let the risk manager approve trades
+                # that record_buy() then silently rejects because cost > self.cash.
+                cash = max(0.0, portfolio_state.get("cash", 0))
                 price = (
                     (current_prices or {}).get(trade.ticker)
                     or self._get_current_price(trade.ticker, portfolio_state)
@@ -120,7 +121,7 @@ class RiskManager:
                 if price and price > 0:
                     # Max quantity by cash reserve: keep CASH_RESERVE_PCT of total_value in cash
                     required_reserve = total_value * CASH_RESERVE_PCT
-                    available_to_spend = max(0.0, buying_power - required_reserve)
+                    available_to_spend = max(0.0, cash - required_reserve)
                     max_qty_by_cash = int(available_to_spend / price)
 
                     # Max quantity by position size: single ticker <= MAX_POSITION_PCT of total_value
@@ -146,9 +147,9 @@ class RiskManager:
                             )
                         else:
                             logger.info(
-                                "REJECTED buy %s: insufficient buying power after %.1f%% reserve "
-                                "(buying_power=%.2f, reserve=%.2f)",
-                                trade.ticker, CASH_RESERVE_PCT * 100, buying_power, required_reserve,
+                                "REJECTED buy %s: insufficient cash after %.1f%% reserve "
+                                "(cash=%.2f, reserve=%.2f)",
+                                trade.ticker, CASH_RESERVE_PCT * 100, cash, required_reserve,
                             )
                         continue
 
