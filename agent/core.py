@@ -152,7 +152,8 @@ class AgentCore:
 
             # Detect market close: stop WebSocket to avoid reconnect churn overnight
             if not in_market and was_market_hours:
-                logger.info("Market closed — stopping WebSocket until next open")
+                logger.info("Market closed — stopping WebSocket and price flush until next open")
+                self._price_flush_running = False
                 self._market_data.stop()
 
             # Detect market open transition: re-run pre-market setup each new day

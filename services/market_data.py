@@ -16,6 +16,9 @@ from config.settings import (
 
 logger = logging.getLogger(__name__)
 
+# Prices older than this are considered stale and excluded from decision cycles.
+_STALE_PRICE_SECONDS = 300  # 5 minutes
+
 
 @dataclass
 class PriceUpdate:
@@ -53,22 +56,46 @@ class MarketDataService:
     def stop(self):
         """Stop WebSocket connection and wait for thread to exit."""
         self._running = False
-        if self._ws is not None:
-            self._ws.close()
+        # Read self._ws under lock to avoid racing with _connect()'s assignment.
+        with self._lock:
+            ws = self._ws
+        if ws is not None:
+            ws.close()
         if self._ws_thread and self._ws_thread.is_alive():
             self._ws_thread.join(timeout=5)
         self._ws_thread = None
         logger.info("MarketDataService stopped")
 
     def get_price(self, symbol: str) -> float | None:
-        """Get latest price for a symbol."""
+        """Get latest price for a symbol. Returns None if price is stale."""
         with self._lock:
-            return self.prices.get(symbol)
+            price = self.prices.get(symbol)
+            ts = self.timestamps.get(symbol)
+        if price is None:
+            return None
+        if ts is not None:
+            age = (datetime.now() - ts).total_seconds()
+            if age > _STALE_PRICE_SECONDS:
+                logger.debug("Stale price for %s (age=%.0fs)", symbol, age)
+                return None
+        return price
 
     def get_all_prices(self) -> dict[str, float]:
-        """Get all current prices."""
+        """Get all current prices, excluding any that have gone stale."""
+        now = datetime.now()
         with self._lock:
-            return dict(self.prices)
+            result = {}
+            for symbol, price in self.prices.items():
+                ts = self.timestamps.get(symbol)
+                if ts is not None:
+                    age = (now - ts).total_seconds()
+                    if age > _STALE_PRICE_SECONDS:
+                        logger.debug(
+                            "Dropping stale price for %s (age=%.0fs)", symbol, age
+                        )
+                        continue
+                result[symbol] = price
+        return result
 
     def get_price_change(self, symbol: str, minutes: int) -> float | None:
         """Get price change % over last N minutes. Returns None if insufficient data."""
@@ -96,16 +123,23 @@ class MarketDataService:
         while self._running:
             try:
                 url = f"{FINNHUB_WS_URL}?token={FINNHUB_API_KEY}"
-                self._ws = websocket.WebSocketApp(
+                ws = websocket.WebSocketApp(
                     url,
                     on_message=self._on_message,
                     on_error=self._on_error,
                     on_close=self._on_close,
                     on_open=self._on_open,
                 )
-                self._ws.run_forever()
+                # Assign under lock so stop() sees a consistent reference.
+                with self._lock:
+                    self._ws = ws
+                # ping_interval/ping_timeout detect silent TCP hangs;
+                # without these, a dropped connection stalls run_forever() indefinitely.
+                ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as exc:
                 logger.error("WebSocket connection error: %s", exc)
+                # Apply backoff on hard failures too (not only on clean closes).
+                self._reconnect_delay = min(self._reconnect_delay * 2, 60)
             if self._running:
                 logger.info(
                     "Reconnecting in %d seconds...", self._reconnect_delay
@@ -116,8 +150,21 @@ class MarketDataService:
         """Handle incoming WebSocket message from Finnhub."""
         try:
             data = json.loads(message)
-            if data.get("type") != "trade":
+            msg_type = data.get("type")
+
+            # Finnhub sends {"type":"error","msg":"..."} on rate-limit and auth failures.
+            # Without this check the error frame is silently swallowed and prices freeze.
+            if msg_type == "error":
+                logger.warning(
+                    "Finnhub error frame: %s — forcing reconnect",
+                    data.get("msg", "(no message)"),
+                )
+                ws.close()
                 return
+
+            if msg_type != "trade":
+                return
+
             for trade in data.get("data", []):
                 symbol = trade.get("s")
                 price = trade.get("p")
@@ -125,7 +172,11 @@ class MarketDataService:
                 timestamp_ms = trade.get("t")
                 if symbol is None or price is None:
                     continue
-                timestamp = datetime.fromtimestamp(timestamp_ms / 1000.0)
+                # Guard against missing timestamp field to avoid TypeError on division.
+                if timestamp_ms is None:
+                    timestamp = datetime.now()
+                else:
+                    timestamp = datetime.fromtimestamp(timestamp_ms / 1000.0)
                 update = PriceUpdate(
                     symbol=symbol,
                     price=float(price),
@@ -177,7 +228,13 @@ class MarketDataService:
             )
             for callback in self._callbacks:
                 try:
-                    callback(symbol, change, price)
+                    # Dispatch in a separate thread so SQLite writes in the callback
+                    # don't stall the WebSocket receive loop.
+                    threading.Thread(
+                        target=callback,
+                        args=(symbol, change, price),
+                        daemon=True,
+                    ).start()
                 except Exception as exc:
                     logger.error(
                         "Callback error for significant move on %s: %s",
