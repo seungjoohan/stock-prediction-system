@@ -159,6 +159,28 @@ class TestRiskManagerValidateTrades(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].quantity, 6)
 
+    def test_multi_buy_committed_cash_prevents_overspend(self):
+        # cash=7000, total=100000; reserve=5000 (5%); available=2000
+        # Two buys each requesting 13 shares at $150 (~$1950 each).
+        # First buy: available=2000 → max_qty=13, cost=1950 → approved, committed=1950.
+        # Second buy: available=2000-1950=50 → max_qty=0 → rejected.
+        # Without committed tracking both would be approved (total $3900 > $2000 available).
+        portfolio = _base_portfolio(
+            cash=7000.0,
+            total_value=100000.0,
+            positions=[
+                {"ticker": "AAPL", "quantity": 0, "current_price": 150.0, "avg_cost": 0.0},
+                {"ticker": "MSFT", "quantity": 0, "current_price": 150.0, "avg_cost": 0.0},
+            ],
+        )
+        trade1 = _make_trade(ticker="AAPL", action="buy", quantity=13, confidence=0.9)
+        trade2 = _make_trade(ticker="MSFT", action="buy", quantity=13, confidence=0.9)
+        current_prices = {"AAPL": 150.0, "MSFT": 150.0}
+        result = self.rm.validate_trades([trade1, trade2], portfolio, current_prices=current_prices)
+        # Only first buy approved; second rejected because committed cash exhausted the budget
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].ticker, "AAPL")
+
     def test_cash_reserve_sufficient_allows_buy(self):
         # 1 share at $10 = $10 cost; cash=20000, total=100000
         # reserve required = 10000; cash after buy = 19990 > 10000 → approved

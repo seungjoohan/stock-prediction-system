@@ -59,6 +59,10 @@ class RiskManager:
                 candidates.insert(0, sell)
 
         approved: list[TradeAction] = []
+        # Track cash committed by buys approved earlier in this same cycle so
+        # subsequent approvals see the reduced available balance, preventing
+        # multiple trades from collectively spending more than the actual cash.
+        committed_cash = 0.0
 
         daily_loss_exceeded = self._check_daily_loss(portfolio_state)
 
@@ -119,9 +123,11 @@ class RiskManager:
                     or self._get_current_price(trade.ticker, portfolio_state)
                 )
                 if price and price > 0:
-                    # Max quantity by cash reserve: keep CASH_RESERVE_PCT of total_value in cash
+                    # Max quantity by cash reserve: keep CASH_RESERVE_PCT of total_value in cash.
+                    # Subtract committed_cash so earlier approvals in this cycle reduce the
+                    # budget for later trades, preventing collective overspend.
                     required_reserve = total_value * CASH_RESERVE_PCT
-                    available_to_spend = max(0.0, cash - required_reserve)
+                    available_to_spend = max(0.0, cash - required_reserve - committed_cash)
                     max_qty_by_cash = int(available_to_spend / price)
 
                     # Max quantity by position size: single ticker <= MAX_POSITION_PCT of total_value
@@ -193,6 +199,14 @@ class RiskManager:
             approved.append(trade)
             if not is_sell:
                 self._trades_today += 1
+                # Deduct the cost from the intra-cycle cash budget so subsequent
+                # buys in the same decision cycle see reduced available cash.
+                buy_price = (
+                    (current_prices or {}).get(trade.ticker)
+                    or self._get_current_price(trade.ticker, portfolio_state)
+                )
+                if buy_price and buy_price > 0:
+                    committed_cash += trade.quantity * buy_price
 
         return approved
 
