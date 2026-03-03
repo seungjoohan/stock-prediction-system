@@ -38,16 +38,17 @@ def init_db() -> None:
             );
 
             CREATE TABLE IF NOT EXISTS trades (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp   TEXT NOT NULL,
-                ticker      TEXT NOT NULL,
-                action      TEXT NOT NULL CHECK(action IN ('buy','sell')),
-                quantity    REAL NOT NULL,
-                price       REAL NOT NULL,
-                total_value REAL NOT NULL,
-                reasoning   TEXT,
-                confidence  REAL,
-                order_id    TEXT
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp        TEXT NOT NULL,
+                ticker           TEXT NOT NULL,
+                action           TEXT NOT NULL CHECK(action IN ('buy','sell')),
+                quantity         REAL NOT NULL,
+                price            REAL NOT NULL,
+                total_value      REAL NOT NULL,
+                reasoning        TEXT,
+                confidence       REAL,
+                order_id         TEXT,
+                avg_cost_at_time REAL
             );
 
             CREATE TABLE IF NOT EXISTS portfolio_snapshots (
@@ -141,17 +142,21 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL
             );
         """)
+        # Live migration: add avg_cost_at_time to existing databases that predate this column.
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
+        if "avg_cost_at_time" not in existing_cols:
+            conn.execute("ALTER TABLE trades ADD COLUMN avg_cost_at_time REAL")
 
 
 def insert_trade(trade_dict: dict[str, Any]) -> int:
     trade_dict.setdefault("timestamp", _now_iso())
     columns = ["timestamp", "ticker", "action", "quantity", "price",
-                "total_value", "reasoning", "confidence", "order_id"]
+                "total_value", "reasoning", "confidence", "order_id", "avg_cost_at_time"]
     values = [trade_dict.get(col) for col in columns]
     sql = (
         "INSERT INTO trades (timestamp, ticker, action, quantity, price, "
-        "total_value, reasoning, confidence, order_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "total_value, reasoning, confidence, order_id, avg_cost_at_time) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     with _get_connection() as conn:
         cursor = conn.execute(sql, values)

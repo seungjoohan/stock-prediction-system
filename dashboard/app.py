@@ -6,13 +6,17 @@ import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+import math
+
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import yfinance as yf
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from config.settings import DB_PATH, INITIAL_CAPITAL
+from config.settings import DB_PATH, INITIAL_CAPITAL, ALPACA_API_KEY, ALPACA_SECRET_KEY
 
 st.set_page_config(page_title="Trading Agent Dashboard", layout="wide")
 
@@ -78,6 +82,38 @@ def fetch_positions() -> pd.DataFrame:
         return df
     except Exception:
         return pd.DataFrame()
+
+
+@st.cache_data(ttl=60)
+def fetch_alpaca_account() -> dict:
+    """Fetch live account + all positions (long & short) from Alpaca.
+    Returns {} on any failure so callers can fall back to DB data.
+    """
+    try:
+        import os
+        from alpaca.trading.client import TradingClient as _TC
+        _paper = os.getenv("ALPACA_PAPER_TRADING", "true").lower() == "true"
+        _client = _TC(api_key=ALPACA_API_KEY, secret_key=ALPACA_SECRET_KEY, paper=_paper)
+        acct = _client.get_account()
+        positions = _client.get_all_positions()
+        total_unrealized = sum(float(p.unrealized_pl) for p in positions)
+        total_cost_basis = sum(float(p.cost_basis) for p in positions)
+        long_mv  = sum(float(p.market_value) for p in positions if float(p.qty) > 0)
+        short_mv = sum(float(p.market_value) for p in positions if float(p.qty) < 0)
+        return {
+            "equity": float(acct.equity),
+            "last_equity": float(acct.last_equity),
+            "cash": float(acct.cash),
+            "buying_power": float(acct.buying_power),
+            "long_market_value": long_mv,
+            "short_market_value": short_mv,
+            "unrealized_pnl": total_unrealized,
+            "cost_basis": total_cost_basis,
+            "n_long": sum(1 for p in positions if float(p.qty) > 0),
+            "n_short": sum(1 for p in positions if float(p.qty) < 0),
+        }
+    except Exception:
+        return {}
 
 
 @st.cache_data(ttl=300)
@@ -199,6 +235,11 @@ def fetch_performance_stats() -> dict:
         "win_rate": None,
         "best_trade": None,
         "worst_trade": None,
+        "profit_factor": None,
+        "avg_win": None,
+        "avg_loss": None,
+        "sell_count_evaluated": 0,
+        "short_count_evaluated": 0,
     }
     try:
         with get_db_connection() as conn:
@@ -215,37 +256,224 @@ def fetch_performance_stats() -> dict:
             ).fetchone()
             stats["sell_count"] = row["cnt"] if row else 0
 
+            # --- Long trades: sells matched to prior buys ---
             sell_rows = conn.execute(
-                "SELECT t.ticker, t.price as sell_price, t.quantity, t.total_value, t.timestamp, "
-                "p.avg_cost "
-                "FROM trades t "
-                "LEFT JOIN positions p ON t.ticker = p.ticker "
-                "WHERE t.action = 'sell'",
+                "SELECT ticker, price as sell_price, quantity, total_value, timestamp, avg_cost_at_time "
+                "FROM trades "
+                "WHERE action = 'sell' AND price > 0 AND quantity > 0",
             ).fetchall()
 
-            if sell_rows:
-                pnls = []
-                for r in sell_rows:
-                    if r["avg_cost"] is not None:
-                        pnl = (r["sell_price"] - r["avg_cost"]) * r["quantity"]
-                        pnls.append(
-                            {
-                                "ticker": r["ticker"],
-                                "timestamp": r["timestamp"],
+            long_pnls = []
+            for r in sell_rows:
+                avg_cost = r["avg_cost_at_time"]
+                if avg_cost is None:
+                    # Reconstruct point-in-time avg_cost from cumulative buy history
+                    # for trades that predate the avg_cost_at_time column.
+                    buy_agg = conn.execute(
+                        "SELECT SUM(price * quantity) / SUM(quantity) as avg_cost "
+                        "FROM trades "
+                        "WHERE ticker = ? AND action = 'buy' "
+                        "AND price > 0 AND quantity > 0 AND timestamp < ?",
+                        [r["ticker"], r["timestamp"]],
+                    ).fetchone()
+                    if buy_agg and buy_agg["avg_cost"] is not None:
+                        avg_cost = buy_agg["avg_cost"]
+                if avg_cost is not None and avg_cost > 0:
+                    pnl = (r["sell_price"] - avg_cost) * r["quantity"]
+                    long_pnls.append({
+                        "ticker": r["ticker"],
+                        "timestamp": r["timestamp"],
+                        "pnl": pnl,
+                        "trade_type": "long",
+                    })
+            stats["sell_count_evaluated"] = len(long_pnls)
+
+            # --- Short trades: FIFO position simulation ---
+            # Simulate net position per ticker chronologically.
+            # When a sell pushes position to ≤0 → short entry (FIFO queue).
+            # When a buy reduces a negative position → short close, compute PnL.
+            from collections import defaultdict, deque
+
+            all_trades_for_sim = conn.execute(
+                "SELECT ticker, action, price, quantity, timestamp "
+                "FROM trades WHERE price > 0 AND quantity > 0 "
+                "ORDER BY timestamp ASC",
+            ).fetchall()
+
+            net_positions: dict = defaultdict(float)
+            short_queues: dict = defaultdict(deque)  # (entry_price, qty) per ticker
+            short_pnls = []
+
+            for t in all_trades_for_sim:
+                ticker = t["ticker"]
+                action = t["action"]
+                price = float(t["price"])
+                qty = float(t["quantity"])
+                cur_pos = net_positions[ticker]
+
+                if action == "sell":
+                    if cur_pos >= qty:
+                        # Closing/reducing a long — long-close logic handles PnL above
+                        net_positions[ticker] -= qty
+                    elif cur_pos > 0:
+                        # Partially closing long; remainder opens short
+                        short_open_qty = qty - cur_pos
+                        net_positions[ticker] = -short_open_qty
+                        short_queues[ticker].append((price, short_open_qty))
+                    else:
+                        # Position already 0 or negative — pure short entry
+                        short_queues[ticker].append((price, qty))
+                        net_positions[ticker] -= qty
+
+                elif action == "buy":
+                    if cur_pos < 0:
+                        # Covering short position (FIFO)
+                        cover_qty = min(qty, abs(cur_pos))
+                        remaining = cover_qty
+                        while remaining > 0 and short_queues[ticker]:
+                            entry_price, entry_qty = short_queues[ticker][0]
+                            closed = min(entry_qty, remaining)
+                            pnl = (entry_price - price) * closed
+                            short_pnls.append({
+                                "ticker": ticker,
+                                "timestamp": t["timestamp"],
                                 "pnl": pnl,
-                                "sell_price": r["sell_price"],
-                            }
-                        )
-                if pnls:
-                    wins = sum(1 for p in pnls if p["pnl"] > 0)
-                    stats["win_rate"] = wins / len(pnls) * 100
-                    best = max(pnls, key=lambda x: x["pnl"])
-                    worst = min(pnls, key=lambda x: x["pnl"])
-                    stats["best_trade"] = best
-                    stats["worst_trade"] = worst
+                                "trade_type": "short",
+                            })
+                            remaining -= closed
+                            if closed >= entry_qty:
+                                short_queues[ticker].popleft()
+                            else:
+                                short_queues[ticker][0] = (entry_price, entry_qty - closed)
+                    net_positions[ticker] += qty
+
+            stats["short_count_evaluated"] = len(short_pnls)
+
+            # --- Combine long + short PnLs for aggregate stats ---
+            all_pnls = long_pnls + short_pnls
+            if all_pnls:
+                wins = sum(1 for p in all_pnls if p["pnl"] > 0)
+                stats["win_rate"] = wins / len(all_pnls) * 100
+                best = max(all_pnls, key=lambda x: x["pnl"])
+                worst = min(all_pnls, key=lambda x: x["pnl"])
+                stats["best_trade"] = best
+                stats["worst_trade"] = worst
+
+                wins_pnl = [p["pnl"] for p in all_pnls if p["pnl"] > 0]
+                losses_pnl = [p["pnl"] for p in all_pnls if p["pnl"] <= 0]
+                gross_wins = sum(wins_pnl)
+                gross_losses = sum(losses_pnl)
+                if gross_losses != 0:
+                    stats["profit_factor"] = gross_wins / abs(gross_losses)
+                elif gross_wins > 0:
+                    stats["profit_factor"] = float("inf")
+                stats["avg_win"] = sum(wins_pnl) / len(wins_pnl) if wins_pnl else None
+                stats["avg_loss"] = sum(losses_pnl) / len(losses_pnl) if losses_pnl else None
     except Exception:
         pass
     return stats
+
+
+_RF_ANNUAL = 0.043   # ~10Y Treasury approximation
+_RF_DAILY  = _RF_ANNUAL / 252
+_MIN_DAYS_FOR_RISK_METRICS = 20  # minimum trading days before ratios are meaningful
+
+
+@st.cache_data(ttl=300)
+def fetch_risk_metrics() -> dict:
+    """Sharpe, Sortino, Max Drawdown, Calmar — resampled to daily from 15-min snapshots."""
+    result = {"sharpe": None, "sortino": None, "max_drawdown_pct": None, "calmar": None,
+              "n_days": 0, "insufficient_data": False}
+    try:
+        history = fetch_portfolio_history()
+        if history.empty or len(history) < 2:
+            return result
+        daily = (
+            history.set_index("timestamp")["total_value"]
+            .resample("D")
+            .last()
+            .dropna()
+        )
+        if len(daily) < 2:
+            return result
+        daily_returns = daily.pct_change().dropna()
+        result["n_days"] = len(daily_returns)
+        if len(daily_returns) < 2:
+            return result
+        if len(daily_returns) < _MIN_DAYS_FOR_RISK_METRICS:
+            result["insufficient_data"] = True
+        mean_ret = daily_returns.mean()
+        std_ret  = daily_returns.std(ddof=1)
+        if std_ret and not np.isnan(std_ret) and std_ret > 0:
+            result["sharpe"] = (mean_ret - _RF_DAILY) / std_ret * math.sqrt(252)
+        downside = daily_returns[daily_returns < _RF_DAILY]
+        if len(downside) == 0:
+            result["sortino"] = float("inf")
+        elif len(downside) >= 2:
+            ds_std = downside.std(ddof=1)
+            if ds_std > 0:
+                result["sortino"] = (mean_ret - _RF_DAILY) / ds_std * math.sqrt(252)
+        cum_max = daily.cummax()
+        drawdowns = (daily - cum_max) / cum_max
+        result["max_drawdown_pct"] = drawdowns.min() * 100
+        n_days = len(daily)
+        total_ret = (daily.iloc[-1] / daily.iloc[0]) - 1
+        ann_ret = (1 + total_ret) ** (252 / n_days) - 1
+        abs_max_dd = abs(drawdowns.min())
+        if abs_max_dd > 0:
+            result["calmar"] = ann_ret / abs_max_dd
+        elif ann_ret >= 0:
+            result["calmar"] = float("inf")
+    except Exception:
+        pass
+    return result
+
+
+@st.cache_data(ttl=3600)
+def fetch_spy_comparison() -> dict:
+    """SPY buy-and-hold vs portfolio, both normalized to INITIAL_CAPITAL. TTL=1hr."""
+    result = {"portfolio_norm": None, "spy_norm": None, "spy_total_return_pct": None, "error": None}
+    try:
+        history = fetch_portfolio_history()
+        if history.empty:
+            result["error"] = "No portfolio history available."
+            return result
+        port_daily = (
+            history.set_index("timestamp")["total_value"]
+            .resample("D")
+            .last()
+            .dropna()
+        )
+        if len(port_daily) < 2:
+            result["error"] = "Not enough portfolio history for comparison."
+            return result
+        start_date = port_daily.index[0].date()
+        end_date   = port_daily.index[-1].date()
+        spy_raw = yf.download(
+            "SPY",
+            start=str(start_date),
+            end=str(end_date + pd.Timedelta(days=1)),
+            progress=False,
+            auto_adjust=True,
+        )
+        if spy_raw.empty:
+            result["error"] = "SPY data unavailable."
+            return result
+        spy_close = spy_raw["Close"].squeeze()
+        spy_close.index = pd.to_datetime(spy_close.index).tz_localize(None)
+        port_daily.index = port_daily.index.tz_localize(None) if port_daily.index.tzinfo else port_daily.index
+        port_aligned = port_daily.reindex(spy_close.index, method="ffill")
+        first_spy  = spy_close.iloc[0]
+        first_port = port_aligned.iloc[0]
+        if first_spy == 0 or first_port == 0 or pd.isna(first_port):
+            result["error"] = "Could not normalize — missing data at start date."
+            return result
+        result["spy_norm"]              = spy_close / first_spy * INITIAL_CAPITAL
+        result["portfolio_norm"]        = port_aligned / first_port * INITIAL_CAPITAL
+        result["spy_total_return_pct"]  = (spy_close.iloc[-1] / first_spy - 1) * 100
+    except Exception:
+        result["error"] = "SPY data unavailable."
+    return result
 
 
 # --- Sidebar ---
@@ -297,70 +525,83 @@ if page == "Portfolio Overview":
     _day_open = fetch_day_open_snapshot()
 
     col1, col2, col3, col4, col5 = st.columns(5)
-    if snapshot:
-        # Cash only changes on trades — read from snapshot
-        cash = snapshot.get("cash") or 0.0
 
-        # Compute positions metrics live from WebSocket prices + DB quantities/avg_cost
-        if not _positions_ov.empty:
-            _pos = _positions_ov.copy()
-            if not _live_prices_ov.empty:
-                _pos = _pos.merge(_live_prices_ov[["ticker", "live_price"]], on="ticker", how="left")
-            else:
-                _pos["live_price"] = None
-            _pos["effective_price"] = (
-                _pos["live_price"]
-                .fillna(_pos["current_price"])
-                .fillna(_pos["avg_cost"])
-            )
-            positions_value = (_pos["effective_price"] * _pos["quantity"]).sum()
-            cost_basis = (_pos["avg_cost"] * _pos["quantity"]).sum()
-            unrealized_pnl = positions_value - cost_basis
-        else:
-            positions_value = 0.0
-            cost_basis = 0.0
-            unrealized_pnl = 0.0
+    # Alpaca is the source of truth for portfolio value.
+    # The local DB positions table only tracks long positions; Alpaca includes
+    # short positions too.  We use Alpaca equity/positions directly, and fall
+    # back to the DB snapshot only if the API is unreachable.
+    _alpaca = fetch_alpaca_account()
 
-        total_value = cash + positions_value
-
-        # Realized P&L from accounting identity — consistent with all live data:
-        # total_gain = realized + unrealized  →  realized = total_gain - unrealized
-        # = (cash + cost_basis) - INITIAL_CAPITAL
-        realized_pnl = total_value - INITIAL_CAPITAL - unrealized_pnl
-
-        # Today's P&L: live total vs day-open snapshot total
-        if _day_open:
+    if _alpaca:
+        total_value    = _alpaca["equity"]
+        cash           = _alpaca["cash"]
+        buying_power   = _alpaca["buying_power"]
+        long_mv        = _alpaca["long_market_value"]
+        short_mv       = _alpaca["short_market_value"]
+        unrealized_pnl = _alpaca["unrealized_pnl"]
+        realized_pnl   = total_value - INITIAL_CAPITAL - unrealized_pnl
+        last_equity    = _alpaca.get("last_equity")
+        if last_equity:
+            daily_pnl = total_value - last_equity
+        elif _day_open:
             daily_pnl = total_value - (_day_open.get("total_value") or total_value)
         else:
-            daily_pnl = snapshot.get("daily_pnl") or 0.0
-
-        col1.metric("Total Value", f"${total_value:,.2f}")
-        col2.metric(
-            "Asset Value",
-            f"${positions_value:,.2f}",
-            delta=f"+${unrealized_pnl:,.2f}" if unrealized_pnl >= 0 else f"-${abs(unrealized_pnl):,.2f}",
-        )
-        col2.caption(f"Cost basis: ${cost_basis:,.2f}")
-        col3.metric("Cash", f"${cash:,.2f}")
-        col4.metric(
-            "Today's P&L",
-            f"${daily_pnl:,.2f}",
-            delta=f"{daily_pnl / total_value * 100:+.2f}%" if total_value else None,
-        )
-        col5.metric(
-            "Realized P&L",
-            f"${realized_pnl:,.2f}",
-            delta=f"{realized_pnl / total_value * 100:+.2f}%" if total_value else None,
-        )
-
-        if not _live_prices_ov.empty:
-            freshest = _live_prices_ov["price_updated_at"].max()
-            st.caption(f"Prices: Finnhub WebSocket  |  Last updated: {_to_et(freshest)}")
-        else:
-            st.caption("Prices: Alpaca sync (live prices not yet available — agent may not be running)")
+            daily_pnl = snapshot.get("daily_pnl") or 0.0 if snapshot else 0.0
+        n_long  = _alpaca.get("n_long", 0)
+        n_short = _alpaca.get("n_short", 0)
+        source_label = f"Alpaca live  |  {n_long} long, {n_short} short"
+    elif snapshot:
+        cash           = snapshot.get("cash") or 0.0
+        total_value    = snapshot.get("total_value") or 0.0
+        unrealized_pnl = snapshot.get("unrealized_pnl") or 0.0
+        realized_pnl   = snapshot.get("realized_pnl") or 0.0
+        daily_pnl      = snapshot.get("daily_pnl") or 0.0
+        buying_power   = 0.0
+        long_mv        = snapshot.get("positions_value") or 0.0
+        short_mv       = 0.0
+        source_label   = "DB snapshot (Alpaca unavailable — agent may not be running)"
+        n_long = n_short = 0
     else:
         for col in [col1, col2, col3, col4, col5]:
             col.metric("—", "No data")
+        source_label = ""
+        total_value = unrealized_pnl = realized_pnl = daily_pnl = cash = buying_power = long_mv = short_mv = 0.0
+        n_long = n_short = 0
+
+    if total_value:
+        col1.metric("Total Value", f"${total_value:,.2f}")
+        col2.metric(
+            "Unrealized P&L",
+            f"${unrealized_pnl:,.2f}",
+            delta=f"{unrealized_pnl / total_value * 100:+.2f}%" if total_value else None,
+        )
+        col3.metric(
+            "Today's P&L",
+            f"${daily_pnl:,.2f}",
+            delta=f"{daily_pnl / (total_value - daily_pnl) * 100:+.2f}%" if (total_value - daily_pnl) else None,
+        )
+        col4.metric(
+            "Realized P&L",
+            f"${realized_pnl:,.2f}",
+            delta=f"{realized_pnl / INITIAL_CAPITAL * 100:+.2f}%" if INITIAL_CAPITAL else None,
+        )
+        col5.metric("Buying Power", f"${buying_power:,.2f}")
+
+        # Exposure breakdown row
+        exp_c1, exp_c2, exp_c3, exp_c4 = st.columns(4)
+        exp_c1.metric("Long Exposure", f"${long_mv:,.2f}")
+        exp_c2.metric("Short Exposure", f"${short_mv:,.2f}")
+        exp_c3.metric("Cash", f"${cash:,.2f}")
+        if cash < 0:
+            exp_c3.caption(f"Margin borrowed: ${abs(cash):,.2f}")
+        leverage = (long_mv + abs(short_mv)) / total_value if total_value else 0
+        exp_c4.metric("Gross Leverage", f"{leverage:.2f}x")
+
+    if not _live_prices_ov.empty:
+        freshest = _live_prices_ov["price_updated_at"].max()
+        st.caption(f"Prices: Finnhub WebSocket  |  Last updated: {_to_et(freshest)}  |  Source: {source_label}")
+    else:
+        st.caption(f"Source: {source_label}")
 
     st.markdown("---")
     st.subheader("Portfolio Value Over Time")
@@ -369,36 +610,61 @@ if page == "Portfolio Overview":
     if history.empty:
         st.info("No portfolio history yet.")
     else:
+        # Correction boundary: snapshots before this timestamp used long-only accounting
+        # and overstate portfolio value by ~$57k (short positions were ignored).
+        _correction_ts = pd.Timestamp("2026-03-01T19:10:41", tz="UTC").tz_convert("America/New_York")
+        pre = history[history["timestamp"] < _correction_ts]
+        post = history[history["timestamp"] >= _correction_ts]
+
         fig = go.Figure()
-        fig.add_trace(
-            go.Scatter(
-                x=history["timestamp"],
-                y=history["total_value"],
-                mode="lines",
-                name="Portfolio Value",
+        if not pre.empty:
+            fig.add_trace(go.Scatter(
+                x=pre["timestamp"], y=pre["total_value"],
+                mode="lines", name="Portfolio Value (long-only, overstated)",
+                line=dict(color="#aec7e8", width=2, dash="dot"),
+            ))
+        if not post.empty:
+            fig.add_trace(go.Scatter(
+                x=post["timestamp"], y=post["total_value"],
+                mode="lines", name="Portfolio Value (Alpaca equity, accurate)",
                 line=dict(color="#1f77b4", width=2),
-            )
-        )
+            ))
         fig.add_hline(
             y=INITIAL_CAPITAL,
-            line_dash="dash",
-            line_color="gray",
+            line_dash="dash", line_color="gray",
             annotation_text=f"Starting Capital ${INITIAL_CAPITAL:,.0f}",
             annotation_position="bottom right",
         )
+        if not pre.empty and not post.empty:
+            fig.add_shape(
+                type="line",
+                x0=_correction_ts.isoformat(), x1=_correction_ts.isoformat(),
+                y0=0, y1=1, yref="paper",
+                line=dict(color="orange", dash="dash", width=1.5),
+            )
+            fig.add_annotation(
+                x=_correction_ts.isoformat(), y=1, yref="paper",
+                text="Short tracking added",
+                showarrow=False, xanchor="right",
+                font=dict(color="orange", size=11),
+            )
         fig.update_layout(
-            xaxis_title="Time",
-            yaxis_title="Value ($)",
-            hovermode="x unified",
-            height=400,
+            xaxis_title="Time", yaxis_title="Value ($)",
+            hovermode="x unified", height=400,
             margin=dict(l=0, r=0, t=20, b=0),
         )
         st.plotly_chart(fig, use_container_width=True)
+        if not pre.empty:
+            st.caption(
+                "Dotted line = snapshots recorded before short-position tracking was added (2026-03-01). "
+                "Those values reflect long positions + cash only and overstate true portfolio value by ~$57k. "
+                "Solid line = Alpaca equity (accurate, includes shorts)."
+            )
 
     st.markdown("---")
     st.subheader("Estimated Tax Liability")
 
-    if not snapshot:
+    if not total_value:
         st.info("No snapshot data available.")
     else:
         taxable_realized = max(0.0, realized_pnl)
@@ -447,126 +713,119 @@ if page == "Portfolio Overview":
 elif page == "Positions":
     st.title("Current Positions")
 
-    positions_df = fetch_positions()
+    _alpaca_pos = fetch_alpaca_account()
     live_prices_df = fetch_live_prices()
-    snapshot = fetch_latest_snapshot()
 
-    if positions_df.empty:
-        st.info("No open positions.")
-    else:
-        df = positions_df.copy()
+    if _alpaca_pos:
+        # Pull live positions directly from Alpaca (long + short)
+        try:
+            import os as _os
+            from alpaca.trading.client import TradingClient as _TC2
+            _paper2 = _os.getenv("ALPACA_PAPER_TRADING", "true").lower() == "true"
+            _client2 = _TC2(api_key=ALPACA_API_KEY, secret_key=ALPACA_SECRET_KEY, paper=_paper2)
+            _alpaca_positions = _client2.get_all_positions()
+        except Exception:
+            _alpaca_positions = []
 
-        # Merge live WebSocket prices; fall back to Alpaca-synced current_price
-        if not live_prices_df.empty:
-            df = df.merge(live_prices_df[["ticker", "live_price", "price_updated_at"]],
-                          on="ticker", how="left")
+        if not _alpaca_positions:
+            st.info("No open positions.")
         else:
-            df["live_price"] = None
-            df["price_updated_at"] = None
+            rows = []
+            for p in _alpaca_positions:
+                qty = float(p.qty)
+                side = "Short" if qty < 0 else "Long"
+                avg_entry = float(p.avg_entry_price)
+                current_price = float(p.current_price)
+                market_value = float(p.market_value)
+                unrealized_pl = float(p.unrealized_pl)
+                unrealized_plpc = float(p.unrealized_plpc) * 100
+                rows.append({
+                    "Ticker": p.symbol,
+                    "Side": side,
+                    "Quantity": qty,
+                    "Avg Entry": avg_entry,
+                    "Current Price": current_price,
+                    "Market Value": market_value,
+                    "Unrealized P&L": unrealized_pl,
+                    "Unrealized P&L %": unrealized_plpc,
+                })
 
-        # Coalesce: live WebSocket price → Alpaca-synced price → avg_cost
-        df["effective_price"] = (
-            df["live_price"]
-            .fillna(df["current_price"])
-            .fillna(df["avg_cost"])
-        )
+            df = pd.DataFrame(rows).sort_values(["Side", "Ticker"])
 
-        df["market_value"] = df["effective_price"] * df["quantity"]
-        df["unrealized_pnl"] = (df["effective_price"] - df["avg_cost"]) * df["quantity"]
-        df["unrealized_pnl_pct"] = (
-            (df["effective_price"] - df["avg_cost"]) / df["avg_cost"] * 100
-        )
+            # Totals row
+            total_market_value = df["Market Value"].sum()
+            total_unrealized_pnl = df["Unrealized P&L"].sum()
+            total_cost = df.apply(lambda r: abs(r["Quantity"]) * r["Avg Entry"], axis=1).sum()
+            total_unrealized_pct = (total_unrealized_pnl / total_cost * 100) if total_cost else 0.0
+            total_row = pd.DataFrame([{
+                "Ticker": "TOTAL", "Side": "",
+                "Quantity": float("nan"), "Avg Entry": float("nan"),
+                "Current Price": float("nan"),
+                "Market Value": total_market_value,
+                "Unrealized P&L": total_unrealized_pnl,
+                "Unrealized P&L %": total_unrealized_pct,
+            }])
+            display_df = pd.concat([df, total_row], ignore_index=True)
 
-        display_df = df[
-            [
-                "ticker",
-                "quantity",
-                "avg_cost",
-                "effective_price",
-                "market_value",
-                "unrealized_pnl",
-                "unrealized_pnl_pct",
-                "updated_at",
-            ]
-        ].copy()
-
-        display_df = display_df.rename(
-            columns={
-                "ticker": "Ticker",
-                "quantity": "Quantity",
-                "avg_cost": "Avg Cost",
-                "effective_price": "Current Price",
-                "market_value": "Market Value",
-                "unrealized_pnl": "Unrealized P&L",
-                "unrealized_pnl_pct": "Unrealized P&L %",
-                "updated_at": "Last Synced",
+            format_map = {
+                "Avg Entry": "${:,.2f}",
+                "Current Price": "${:,.2f}",
+                "Market Value": "${:,.2f}",
+                "Unrealized P&L": "${:,.2f}",
+                "Unrealized P&L %": "{:.2f}%",
             }
-        )
-        display_df["Last Synced"] = display_df["Last Synced"].apply(_to_et)
+            styled = display_df.style.format(format_map, na_rep="N/A")
+            st.dataframe(styled, use_container_width=True)
+            st.caption("Live data from Alpaca — includes both long and short positions.")
 
-        # Totals row
-        total_cost_basis = (df["avg_cost"] * df["quantity"]).sum()
-        total_market_value = df["market_value"].sum()
-        total_unrealized_pnl = df["unrealized_pnl"].sum()
-        total_unrealized_pnl_pct = (
-            (total_unrealized_pnl / total_cost_basis * 100) if total_cost_basis else 0.0
-        )
-        total_row = pd.DataFrame([{
-            "Ticker": "TOTAL",
-            "Quantity": float("nan"),
-            "Avg Cost": float("nan"),
-            "Current Price": float("nan"),
-            "Market Value": total_market_value,
-            "Unrealized P&L": total_unrealized_pnl,
-            "Unrealized P&L %": total_unrealized_pnl_pct,
-            "Last Synced": "",
-        }])
-        display_df = pd.concat([display_df, total_row], ignore_index=True)
+            st.markdown("---")
+            st.subheader("Position Allocation")
 
-        format_map = {
-            "Avg Cost": "${:,.2f}",
-            "Current Price": "${:,.2f}",
-            "Market Value": "${:,.2f}",
-            "Unrealized P&L": "${:,.2f}",
-            "Unrealized P&L %": "{:.2f}%",
-        }
-        styled = display_df.style.format(format_map, na_rep="N/A")
-        st.dataframe(styled, use_container_width=True)
+            # Pie chart: use absolute market value for sizing; label shorts distinctly
+            pie_data = df.copy()
+            pie_data["abs_market_value"] = pie_data["Market Value"].abs()
+            pie_data["label"] = pie_data.apply(
+                lambda r: f"{r['Ticker']} ({'S' if r['Side'] == 'Short' else 'L'})", axis=1
+            )
+            cash_value = max(_alpaca_pos.get("cash", 0.0), 0.0)
+            cash_row = pd.DataFrame([{"label": "Cash", "abs_market_value": cash_value}])
+            pie_data = pd.concat([pie_data[["label", "abs_market_value"]], cash_row], ignore_index=True)
 
-        # Price source indicator
-        if not live_prices_df.empty and df["live_price"].notna().any():
-            freshest = df["price_updated_at"].dropna().max()
-            st.caption(f"Prices: Finnhub WebSocket  |  Last updated: {_to_et(freshest)}")
+            fig = go.Figure(go.Pie(
+                labels=pie_data["label"].tolist(),
+                values=pie_data["abs_market_value"].tolist(),
+                hole=0.3, textinfo="percent", textposition="inside",
+                textfont=dict(size=13),
+            ))
+            fig.update_layout(
+                title="Portfolio Allocation (abs market value; S=Short, L=Long)",
+                height=450, margin=dict(l=20, r=20, t=50, b=20),
+                legend=dict(orientation="v", x=1.02, y=0.5, xanchor="left"),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        # Fallback to DB positions (long-only) when Alpaca is unreachable
+        st.warning("Alpaca unavailable — showing long positions from DB only (short positions not reflected).")
+        positions_df = fetch_positions()
+        live_prices_df = fetch_live_prices()
+        snapshot = fetch_latest_snapshot()
+
+        if positions_df.empty:
+            st.info("No open positions.")
         else:
-            st.caption("Prices: Alpaca sync (live prices not yet available — agent may not be running)")
-
-        st.markdown("---")
-        st.subheader("Position Allocation")
-
-        pie_data = df[["ticker", "market_value"]].copy()
-        pie_data["market_value"] = pd.to_numeric(pie_data["market_value"], errors="coerce").fillna(0.0)
-
-        # Derive cash from total_value - positions so negative Alpaca margin cash doesn't break the chart
-        total_value = snapshot.get("total_value", 0.0) if snapshot else 0.0
-        cash_value = max(total_value - pie_data["market_value"].sum(), 0.0)
-        cash_row = pd.DataFrame([{"ticker": "Cash", "market_value": cash_value}])
-        pie_data = pd.concat([pie_data, cash_row], ignore_index=True)
-
-        fig = go.Figure(go.Pie(
-            labels=pie_data["ticker"].tolist(),
-            values=pie_data["market_value"].tolist(),
-            hole=0.3,
-            textinfo="percent",
-            textposition="inside",
-            textfont=dict(size=13),
-        ))
-        fig.update_layout(
-            title="Portfolio Allocation",
-            height=450,
-            margin=dict(l=20, r=20, t=50, b=20),
-            legend=dict(orientation="v", x=1.02, y=0.5, xanchor="left"),
-        )
-        st.plotly_chart(fig, use_container_width=True)
+            df = positions_df.copy()
+            if not live_prices_df.empty:
+                df = df.merge(live_prices_df[["ticker", "live_price", "price_updated_at"]],
+                              on="ticker", how="left")
+            else:
+                df["live_price"] = None
+            df["effective_price"] = df["live_price"].fillna(df["current_price"]).fillna(df["avg_cost"])
+            df["market_value"] = df["effective_price"] * df["quantity"]
+            df["unrealized_pnl"] = (df["effective_price"] - df["avg_cost"]) * df["quantity"]
+            df["unrealized_pnl_pct"] = (df["effective_price"] - df["avg_cost"]) / df["avg_cost"] * 100
+            st.dataframe(df[["ticker", "quantity", "avg_cost", "effective_price",
+                              "market_value", "unrealized_pnl", "unrealized_pnl_pct"]],
+                         use_container_width=True)
 
 
 # --- Page: Trade History ---
@@ -776,67 +1035,251 @@ elif page == "Performance Analytics":
 
     st.markdown("---")
 
-    col4, col5 = st.columns(2)
     win_rate = stats.get("win_rate")
+    n_long_eval = stats.get("sell_count_evaluated", 0)
+    n_short_eval = stats.get("short_count_evaluated", 0)
+    n_eval = n_long_eval + n_short_eval
+    n_sells = stats.get("sell_count", 0)
     if win_rate is not None:
-        col4.metric("Win Rate", f"{win_rate:.2f}%")
-    else:
-        col4.metric("Win Rate", "N/A")
-
-    best = stats.get("best_trade")
-    worst = stats.get("worst_trade")
-
-    if best:
-        col5.metric(
-            f"Best Trade ({best['ticker']} @ {_to_et(best['timestamp'], date_only=True)})",
-            f"${best['pnl']:,.2f}",
-        )
-
-    if worst:
         st.metric(
-            f"Worst Trade ({worst['ticker']} @ {_to_et(worst['timestamp'], date_only=True)})",
-            f"${worst['pnl']:,.2f}",
+            f"Win Rate ({n_long_eval}L+{n_short_eval}S/{n_sells} closed trades)",
+            f"{win_rate:.2f}%",
         )
+    else:
+        st.metric("Win Rate", "N/A")
 
     st.markdown("---")
     st.subheader("Daily Returns")
 
     history = fetch_portfolio_history()
-    if history.empty or "daily_pnl" not in history.columns:
+    if history.empty or "total_value" not in history.columns:
         st.info("No portfolio history for daily returns.")
     else:
-        daily = history.dropna(subset=["daily_pnl"]).copy()
-        if daily.empty:
+        # Recompute daily P&L from day-over-day closing total_value.
+        # This cancels the systematic long-only inflation for historical days
+        # (both start and end of each day had the same overstatement, so the
+        # delta is approximately correct). The correction boundary date (Mar 1)
+        # is excluded so it doesn't mix inflated opens with real closes.
+        _correction_date = "2026-03-01"
+        _pre_hist = history[history["timestamp"].dt.date.astype(str) < _correction_date].copy()
+        _post_hist = history[history["timestamp"].dt.date.astype(str) >= _correction_date].copy()
+
+        daily_rows = []
+        # Pre-correction: use day-over-day closing values
+        if not _pre_hist.empty:
+            _pre_hist["date"] = _pre_hist["timestamp"].dt.date
+            _day_close = _pre_hist.groupby("date")["total_value"].last().reset_index()
+            _day_close["daily_pnl"] = _day_close["total_value"].diff()
+            _day_close.loc[_day_close.index[0], "daily_pnl"] = (
+                _day_close["total_value"].iloc[0] - INITIAL_CAPITAL
+            )
+            daily_rows.append(_day_close[["date", "daily_pnl"]])
+        # Post-correction: same approach but data is already accurate
+        if not _post_hist.empty:
+            _post_hist["date"] = _post_hist["timestamp"].dt.date
+            _day_close_post = _post_hist.groupby("date")["total_value"].last().reset_index()
+            if not _pre_hist.empty:
+                # Link to last pre-correction close
+                _prev_close = _pre_hist.groupby("date")["total_value"].last().iloc[-1]
+            else:
+                _prev_close = INITIAL_CAPITAL
+            _day_close_post["daily_pnl"] = _day_close_post["total_value"].diff()
+            _day_close_post.loc[_day_close_post.index[0], "daily_pnl"] = (
+                _day_close_post["total_value"].iloc[0] - INITIAL_CAPITAL
+            )
+            daily_rows.append(_day_close_post[["date", "daily_pnl"]])
+
+        if not daily_rows:
             st.info("No daily P&L data recorded yet.")
         else:
+            daily = pd.concat(daily_rows, ignore_index=True)
+            daily["date"] = pd.to_datetime(daily["date"])
             daily["daily_return_pct"] = daily["daily_pnl"] / INITIAL_CAPITAL * 100
 
             fig = go.Figure()
             colors = ["green" if v >= 0 else "red" for v in daily["daily_pnl"]]
-            fig.add_trace(
-                go.Bar(
-                    x=daily["timestamp"],
-                    y=daily["daily_pnl"],
-                    marker_color=colors,
-                    name="Daily P&L",
-                )
-            )
+            fig.add_trace(go.Bar(
+                x=daily["date"], y=daily["daily_pnl"],
+                marker_color=colors, name="Daily P&L",
+            ))
             fig.update_layout(
-                xaxis_title="Date",
-                yaxis_title="Daily P&L ($)",
-                height=350,
-                margin=dict(l=0, r=0, t=20, b=0),
+                xaxis_title="Date", yaxis_title="Daily P&L ($)",
+                height=350, margin=dict(l=0, r=0, t=20, b=0),
             )
             st.plotly_chart(fig, use_container_width=True)
 
-            total_return = (
-                (history["total_value"].iloc[-1] - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100
-                if not history.empty
-                else 0.0
-            )
+            # Use Alpaca equity for Total Return — historical snapshots only tracked
+            # long positions and overstate portfolio value by ~$57k (short positions ignored).
+            _alpaca_pa = fetch_alpaca_account()
+            if _alpaca_pa:
+                total_return = (_alpaca_pa["equity"] - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100
+                current_value = _alpaca_pa["equity"]
+            else:
+                total_return = (
+                    (history["total_value"].iloc[-1] - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100
+                    if not history.empty else 0.0
+                )
+                current_value = history["total_value"].iloc[-1] if not history.empty else INITIAL_CAPITAL
             col_a, col_b = st.columns(2)
             col_a.metric("Total Return", f"{total_return:.2f}%")
-            col_b.metric(
-                "Starting Capital",
-                f"${INITIAL_CAPITAL:,.2f}",
+            col_b.metric("Starting Capital", f"${INITIAL_CAPITAL:,.2f}")
+
+    # --- Risk-Adjusted Performance ---
+    st.markdown("---")
+    st.subheader("Risk-Adjusted Performance")
+
+    risk = fetch_risk_metrics()
+    n_days = risk.get("n_days", 0)
+    insufficient = risk.get("insufficient_data", False)
+
+    st.warning(
+        "⚠ Historical snapshots were recorded with **long-only portfolio valuation** — "
+        "short positions (TSLA, NVDA, BA, HD, CRM, etc.) were not included, causing snapshots "
+        "to overstate portfolio value by ~$57k. Sharpe, Sortino, Drawdown and the chart below "
+        "are computed from these inflated values and are **not reliable**. "
+        "They will become accurate once the agent runs and records new corrected snapshots."
+    )
+    if insufficient:
+        st.warning(
+            f"⚠ Only {n_days} trading days of history — risk ratios require "
+            f"{_MIN_DAYS_FOR_RISK_METRICS}+ days to be statistically meaningful. "
+            "Values shown are mathematically correct but unreliable at this sample size."
+        )
+
+    col_r1, col_r2, col_r3, col_r4 = st.columns(4)
+
+    sharpe = risk["sharpe"]
+    col_r1.metric(f"Sharpe Ratio (Ann., n={n_days}d)", f"{sharpe:.2f}" if sharpe is not None else "N/A")
+
+    sortino = risk["sortino"]
+    if sortino is None:
+        col_r2.metric("Sortino Ratio (Ann.)", "N/A")
+    elif sortino == float("inf"):
+        col_r2.metric("Sortino Ratio (Ann.)", "∞ (no down days)")
+    else:
+        col_r2.metric("Sortino Ratio (Ann.)", f"{sortino:.2f}")
+
+    mdd = risk["max_drawdown_pct"]
+    col_r3.metric("Max Drawdown (close-to-close)", f"{mdd:.2f}%" if mdd is not None else "N/A")
+
+    calmar = risk["calmar"]
+    if calmar is None:
+        col_r4.metric("Calmar Ratio", "N/A")
+    elif calmar == float("inf"):
+        col_r4.metric("Calmar Ratio", "∞")
+    else:
+        col_r4.metric("Calmar Ratio", f"{calmar:.2f}")
+
+    st.caption(
+        "Sharpe & Sortino annualized from **close-to-close** daily returns (252 trading days/yr). "
+        "Risk-free rate: 4.3% (10Y Treasury approx.). "
+        "Max Drawdown measures close-to-close — intraday dips appear in the Daily Returns chart above. "
+        "Calmar = Annualized Return / |Max Drawdown|."
+    )
+
+    # --- Trade Quality ---
+    st.markdown("---")
+    st.subheader("Trade Quality")
+
+    col_q1, col_q2, col_q3, col_q4, col_q5 = st.columns(5)
+
+    pf = stats.get("profit_factor")
+    if pf is None:
+        col_q1.metric("Profit Factor", "N/A")
+    elif pf == float("inf"):
+        col_q1.metric("Profit Factor", "∞ (all winners)")
+    else:
+        col_q1.metric("Profit Factor", f"{pf:.2f}")
+
+    avg_win = stats.get("avg_win")
+    col_q2.metric("Avg Win / Trade", f"${avg_win:,.2f}" if avg_win is not None else "N/A")
+
+    avg_loss = stats.get("avg_loss")
+    col_q3.metric("Avg Loss / Trade", f"${avg_loss:,.2f}" if avg_loss is not None else "N/A")
+
+    best = stats.get("best_trade")
+    if best:
+        col_q4.metric(
+            f"Best Trade ({best['ticker']} @ {_to_et(best['timestamp'], date_only=True)})",
+            f"${best['pnl']:,.2f}",
+        )
+    else:
+        col_q4.metric("Best Trade", "N/A")
+
+    worst = stats.get("worst_trade")
+    if worst:
+        col_q5.metric(
+            f"Worst Trade ({worst['ticker']} @ {_to_et(worst['timestamp'], date_only=True)})",
+            f"${worst['pnl']:,.2f}",
+        )
+    else:
+        col_q5.metric("Worst Trade", "N/A")
+
+    st.caption("Based on all closed trades (long closes + covered shorts). Profit Factor = Gross Wins / |Gross Losses|.")
+
+    # --- SPY Comparison ---
+    st.markdown("---")
+    st.subheader("Portfolio vs. Buy-and-Hold SPY")
+
+    spy_data = fetch_spy_comparison()
+
+    if spy_data["error"]:
+        st.warning(f"SPY comparison unavailable: {spy_data['error']}")
+    else:
+        # Use Alpaca equity for the return comparison (same fix as Total Return above)
+        _alpaca_spy = fetch_alpaca_account()
+        if _alpaca_spy:
+            port_total_return = (_alpaca_spy["equity"] - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100
+        else:
+            port_total_return = (
+                (history["total_value"].iloc[-1] - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100
+                if not history.empty else 0.0
             )
+        spy_return = spy_data["spy_total_return_pct"]
+
+        col_s1, col_s2 = st.columns(2)
+        col_s1.metric(
+            "Portfolio Total Return",
+            f"{port_total_return:.2f}%",
+            delta=f"{port_total_return - spy_return:+.2f}% vs SPY",
+        )
+        col_s2.metric("SPY Total Return (same period)", f"{spy_return:.2f}%")
+
+        port_norm = spy_data["portfolio_norm"]
+        spy_norm  = spy_data["spy_norm"]
+
+        fig_spy = go.Figure()
+        fig_spy.add_trace(go.Scatter(
+            x=port_norm.index,
+            y=port_norm.values,
+            mode="lines",
+            name="Portfolio",
+            line=dict(color="#1f77b4", width=2),
+        ))
+        fig_spy.add_trace(go.Scatter(
+            x=spy_norm.index,
+            y=spy_norm.values,
+            mode="lines",
+            name="SPY Buy-and-Hold",
+            line=dict(color="#ff7f0e", width=2, dash="dash"),
+        ))
+        fig_spy.add_hline(
+            y=INITIAL_CAPITAL,
+            line_dash="dot",
+            line_color="gray",
+            annotation_text=f"Starting Capital ${INITIAL_CAPITAL:,.0f}",
+            annotation_position="bottom right",
+        )
+        fig_spy.update_layout(
+            xaxis_title="Date",
+            yaxis_title=f"Value (normalized to ${INITIAL_CAPITAL:,.0f})",
+            hovermode="x unified",
+            height=400,
+            margin=dict(l=0, r=0, t=20, b=0),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        st.plotly_chart(fig_spy, use_container_width=True)
+        st.caption(
+            "Both series normalized to starting capital. "
+            "SPY adjusted close via yfinance (dividend/split-adjusted)."
+        )

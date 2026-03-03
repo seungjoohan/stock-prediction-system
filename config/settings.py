@@ -40,6 +40,12 @@ EARNINGS_BLACKOUT_DAYS = int(os.getenv("EARNINGS_BLACKOUT_DAYS", "2"))
 SIGNIFICANT_MOVE_PCT = float(os.getenv("SIGNIFICANT_MOVE_PCT", "0.02"))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.08"))       # force-sell if position down ≥8%
 
+# --- Short Selling ---
+ALLOW_SHORT_SELLING    = os.getenv("ALLOW_SHORT_SELLING", "false").lower() == "true"
+MAX_SHORT_POSITIONS    = int(os.getenv("MAX_SHORT_POSITIONS", "5"))
+MAX_SHORT_EXPOSURE_PCT = float(os.getenv("MAX_SHORT_EXPOSURE_PCT", "0.10"))
+MIN_SHORT_CONFIDENCE   = float(os.getenv("MIN_SHORT_CONFIDENCE", "0.80"))
+
 # --- Finnhub WebSocket ---
 FINNHUB_WS_URL = "wss://ws.finnhub.io"
 

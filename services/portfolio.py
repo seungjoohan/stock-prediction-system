@@ -152,14 +152,15 @@ class PortfolioService:
             )
             quantity = int(existing["quantity"])
 
+        avg_cost_at_time = existing["avg_cost"]
         proceeds = quantity * price
-        pnl = (price - existing["avg_cost"]) * quantity
+        pnl = (price - avg_cost_at_time) * quantity
 
         self.cash += proceeds
         self.realized_pnl += pnl
 
         new_quantity = existing["quantity"] - quantity
-        update_position(ticker, new_quantity, existing["avg_cost"])
+        update_position(ticker, new_quantity, avg_cost_at_time)
 
         logger.info(
             "SELL recorded: %d shares of %s at %.2f "
@@ -211,21 +212,37 @@ class PortfolioService:
         )
 
     def take_snapshot(self, current_prices: dict[str, float]):
-        """Save current portfolio state to DB."""
-        state = self.get_state(current_prices)
+        """Save current portfolio state to DB.
+
+        Uses Alpaca equity as total_value (source of truth) so that short
+        positions are correctly reflected.  self.equity and self._alpaca_unrealized
+        are populated by sync_from_alpaca() before this is called.
+        """
+        # Alpaca equity = cash + net market value of all positions (longs + shorts).
+        # Using it directly avoids the long-only bias from the local positions table.
+        total_value = self.equity if self.equity else (self.cash + self._alpaca_unrealized)
+        positions_value = total_value - self.cash
+
+        # Daily P&L: compare against today's opening equity snapshot.
+        from datetime import date as _date
+        today_str = _date.today().isoformat()
+        day_open = get_day_open_snapshot(today_str)
+        starting_value = day_open["total_value"] if day_open else INITIAL_CAPITAL
+        daily_pnl = total_value - starting_value
+
         insert_portfolio_snapshot({
-            "total_value": state.total_value,
-            "cash": state.cash,
-            "positions_value": state.positions_value,
-            "realized_pnl": state.realized_pnl,
+            "total_value": total_value,
+            "cash": self.cash,
+            "positions_value": positions_value,
+            "realized_pnl": self.realized_pnl,
             "unrealized_pnl": self._alpaca_unrealized,
-            "daily_pnl": state.daily_pnl,
+            "daily_pnl": daily_pnl,
         })
         logger.info(
             "Portfolio snapshot saved: total_value=%.2f, cash=%.2f, "
             "positions_value=%.2f, unrealized_pnl=%.2f",
-            state.total_value,
-            state.cash,
-            state.positions_value,
+            total_value,
+            self.cash,
+            positions_value,
             self._alpaca_unrealized,
         )

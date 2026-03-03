@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -12,7 +13,12 @@ from config.settings import (
     VIX_CIRCUIT_BREAKER,
     EARNINGS_BLACKOUT_DAYS,
     STOP_LOSS_PCT,
+    ALLOW_SHORT_SELLING,
+    MAX_SHORT_POSITIONS,
+    MAX_SHORT_EXPOSURE_PCT,
+    MIN_SHORT_CONFIDENCE,
 )
+from db.database import insert_agent_log
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +45,7 @@ class RiskManager:
         macro_snapshot: dict | None = None,
         fundamentals: dict | None = None,
         current_prices: dict | None = None,
+        alpaca_positions: list[dict] | None = None,
     ) -> list[TradeAction]:
         """Apply all risk rules. Returns filtered list of approved trades."""
         today = date.today()
@@ -196,6 +203,26 @@ class RiskManager:
                 )
                 continue
 
+            # Detect short entry: sell quantity > held position
+            if trade.action == "sell" and alpaca_positions is not None:
+                held = next(
+                    (float(p["quantity"]) for p in alpaca_positions if p["ticker"] == trade.ticker),
+                    0.0,
+                )
+                if trade.quantity > held:
+                    short_ok, reason = self._validate_short_entry(
+                        trade, held, alpaca_positions,
+                        equity=portfolio_state.get("total_value", 0),
+                        current_prices=current_prices,
+                    )
+                    if not short_ok:
+                        logger.warning("Short entry rejected for %s: %s", trade.ticker, reason)
+                        insert_agent_log("short_rejected", {"ticker": trade.ticker, "reason": reason}, trade.ticker)
+                        if held > 0:
+                            trade = dataclasses.replace(trade, quantity=int(held))
+                        else:
+                            continue
+
             approved.append(trade)
             if not is_sell:
                 self._trades_today += 1
@@ -209,6 +236,39 @@ class RiskManager:
                     committed_cash += trade.quantity * buy_price
 
         return approved
+
+    def _validate_short_entry(
+        self,
+        trade,
+        held_qty: float,
+        alpaca_positions: list[dict],
+        equity: float,
+        current_prices: dict | None = None,
+    ) -> tuple[bool, str]:
+        """
+        Returns (approved: bool, reason: str).
+        Called when a sell would open or expand a short position.
+        """
+        if not ALLOW_SHORT_SELLING:
+            return False, f"Short selling disabled — sell capped at held qty {held_qty:.0f}"
+
+        current_shorts = [p for p in alpaca_positions if float(p.get("quantity", 0)) < 0]
+        ticker_already_short = any(p["ticker"] == trade.ticker for p in current_shorts)
+        if not ticker_already_short and len(current_shorts) >= MAX_SHORT_POSITIONS:
+            return False, f"Max short positions ({MAX_SHORT_POSITIONS}) reached"
+
+        short_exposure = sum(abs(float(p["quantity"]) * float(p.get("current_price", p.get("avg_entry_price", 0))))
+                             for p in current_shorts if p["ticker"] != trade.ticker)
+        # Use live market price (not trade.price — TradeAction has no price field)
+        entry_price = (current_prices or {}).get(trade.ticker, 0.0)
+        new_short_value = trade.quantity * entry_price
+        if equity > 0 and (short_exposure + new_short_value) / equity > MAX_SHORT_EXPOSURE_PCT:
+            return False, f"Short exposure would exceed {MAX_SHORT_EXPOSURE_PCT:.0%} of equity"
+
+        if trade.confidence < MIN_SHORT_CONFIDENCE:
+            return False, f"Confidence {trade.confidence:.2f} below short minimum {MIN_SHORT_CONFIDENCE:.2f}"
+
+        return True, "short approved"
 
     def _check_daily_loss(self, portfolio_state: dict) -> bool:
         """Return True if daily loss exceeds threshold."""

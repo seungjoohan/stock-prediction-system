@@ -12,6 +12,7 @@ from config.settings import (
     MARKET_OPEN_MINUTE,
     MARKET_CLOSE_HOUR,
     MARKET_CLOSE_MINUTE,
+    STOP_LOSS_PCT,
 )
 from db.database import init_db, insert_agent_log, get_company_fundamentals, upsert_live_prices
 from services.market_data import MarketDataService
@@ -45,6 +46,7 @@ class AgentCore:
         self._risk_manager = RiskManager()
         self._rag = RAGService()
 
+        self._trade_lock = threading.Lock()
         self.recent_sentiment: list[dict] = []
         self._minutes_elapsed = 0
         self._last_setup_date: date | None = None
@@ -301,12 +303,14 @@ class AgentCore:
             return
 
         try:
+            alpaca_positions = self._executor.get_positions()
             approved_trades = self._risk_manager.validate_trades(
                 trades=proposed_trades,
                 portfolio_state=portfolio_state_dict,
                 macro_snapshot=macro_snapshot_dict,
                 fundamentals=fundamentals,
                 current_prices=prices,
+                alpaca_positions=alpaca_positions,
             )
             logger.info(
                 "%d of %d proposed trades approved by risk manager",
@@ -333,33 +337,34 @@ class AgentCore:
     def _execute_trades(self, approved_trades: list):
         for trade in approved_trades:
             try:
-                result = self._executor.execute_trade(
-                    ticker=trade.ticker,
-                    action=trade.action,
-                    quantity=trade.quantity,
-                    reasoning=trade.reasoning,
-                    confidence=trade.confidence,
-                )
-                if result is None:
-                    logger.warning(
-                        "Trade execution returned None for %s %s; skipping portfolio record",
-                        trade.action,
-                        trade.ticker,
+                with self._trade_lock:
+                    result = self._executor.execute_trade(
+                        ticker=trade.ticker,
+                        action=trade.action,
+                        quantity=trade.quantity,
+                        reasoning=trade.reasoning,
+                        confidence=trade.confidence,
                     )
-                    continue
-                filled_price = result.get("price", 0.0)
-                if not filled_price:
-                    logger.warning(
-                        "No filled price for %s %s; skipping portfolio record",
-                        trade.action,
-                        trade.ticker,
-                    )
-                    continue
+                    if result is None:
+                        logger.warning(
+                            "Trade execution returned None for %s %s; skipping portfolio record",
+                            trade.action,
+                            trade.ticker,
+                        )
+                        continue
+                    filled_price = result.get("price", 0.0)
+                    if not filled_price:
+                        logger.warning(
+                            "No filled price for %s %s; skipping portfolio record",
+                            trade.action,
+                            trade.ticker,
+                        )
+                        continue
 
-                if trade.action == "buy":
-                    self._portfolio.record_buy(trade.ticker, trade.quantity, filled_price)
-                elif trade.action == "sell":
-                    self._portfolio.record_sell(trade.ticker, trade.quantity, filled_price)
+                    if trade.action == "buy":
+                        self._portfolio.record_buy(trade.ticker, trade.quantity, filled_price)
+                    elif trade.action == "sell":
+                        self._portfolio.record_sell(trade.ticker, trade.quantity, filled_price)
 
                 logger.info(
                     "Trade executed: %s %d %s @ %.2f (confidence=%.2f)",
@@ -393,7 +398,7 @@ class AgentCore:
                     ticker=trade.ticker,
                 )
 
-    def _on_significant_move(self, symbol: str, change: float, price: float):
+    def _on_significant_move(self, symbol: str, change: float, price: float) -> None:
         logger.info(
             "Significant price move: %s changed %.2f%% to %.2f",
             symbol,
@@ -405,6 +410,81 @@ class AgentCore:
             {"change_pct": change, "price": price},
             ticker=symbol,
         )
+        self._emergency_stop_loss_check(symbol, price)
+
+    def _emergency_stop_loss_check(self, symbol: str, price: float) -> None:
+        """
+        Immediately check if a position in `symbol` has breached the stop-loss threshold.
+        Called from the WebSocket significant-move callback thread.
+        Works for both long (price dropped) and short (price rose) positions.
+        """
+        try:
+            positions = self._executor.get_positions()
+            pos = next((p for p in positions if p["ticker"] == symbol), None)
+            if pos is None:
+                return
+
+            qty = float(pos["quantity"])
+            if qty == 0:
+                return
+            avg_entry = float(pos["avg_entry_price"])
+            if avg_entry <= 0:
+                return
+
+            if qty > 0:
+                pnl_pct = (price - avg_entry) / avg_entry
+            else:
+                pnl_pct = (avg_entry - price) / avg_entry
+
+            if pnl_pct > -STOP_LOSS_PCT:
+                return
+
+            logger.warning(
+                "Emergency stop-loss triggered: %s pnl=%.2f%% (threshold=%.2f%%) price=%.2f side=%s",
+                symbol, pnl_pct * 100, -STOP_LOSS_PCT * 100, price,
+                "long" if qty > 0 else "short",
+            )
+
+            # Use non-blocking acquire so the callback never deadlocks the WebSocket thread.
+            # If the main loop is mid-trade, skip the emergency close here — the scheduled
+            # _check_stop_loss_take_profit() running every 15 min is the fallback.
+            acquired = self._trade_lock.acquire(blocking=False)
+            if not acquired:
+                logger.warning(
+                    "Stop-loss skipped for %s — trade lock held by main loop. "
+                    "The 15-min scheduled check will catch it next cycle.",
+                    symbol,
+                )
+                insert_agent_log(
+                    "stop_loss_skipped_lock_held",
+                    {"ticker": symbol, "pnl_pct": pnl_pct, "price": price},
+                    ticker=symbol,
+                )
+                return
+
+            try:
+                result = self._executor.close_position(symbol)
+                if result:
+                    account = self._executor.get_account()
+                    updated_positions = self._executor.get_positions()
+                    self._portfolio.sync_from_alpaca(account, updated_positions)
+                    insert_agent_log(
+                        "emergency_stop_loss",
+                        {
+                            "ticker": symbol,
+                            "pnl_pct": pnl_pct,
+                            "price": price,
+                            "side": "long" if qty > 0 else "short",
+                            "order_id": result.get("id"),
+                        },
+                        ticker=symbol,
+                    )
+                    logger.info("Emergency stop-loss executed for %s", symbol)
+            finally:
+                self._trade_lock.release()
+
+        except Exception as exc:
+            logger.error("Emergency stop-loss check failed for %s: %s", symbol, exc)
 
 
 if __name__ == "__main__":

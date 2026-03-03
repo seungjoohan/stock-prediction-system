@@ -8,7 +8,7 @@ from alpaca.trading.requests import MarketOrderRequest, ClosePositionRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL
-from db.database import insert_trade, insert_agent_log
+from db.database import insert_trade, insert_agent_log, get_positions
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +92,18 @@ class TradeExecutor:
                 error_message,
             )
 
+        # For sell trades, capture avg_cost_at_time before the position is mutated
+        # so dashboard analytics always have a point-in-time cost basis.
+        avg_cost_at_time = None
+        if action_lower == "sell":
+            try:
+                positions = get_positions()
+                pos = next((p for p in positions if p["ticker"] == ticker), None)
+                if pos:
+                    avg_cost_at_time = pos["avg_cost"]
+            except Exception:
+                pass
+
         insert_trade({
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "ticker": ticker,
@@ -102,6 +114,7 @@ class TradeExecutor:
             "reasoning": reasoning,
             "confidence": confidence,
             "order_id": order_id,
+            "avg_cost_at_time": avg_cost_at_time,
         })
 
         if error_message is not None:
