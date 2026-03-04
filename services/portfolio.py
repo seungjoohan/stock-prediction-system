@@ -93,9 +93,25 @@ class PortfolioService:
         )
 
     def record_buy(self, ticker: str, quantity: int, price: float):
-        """Record a buy trade -- update cash and position."""
+        """Record a buy trade -- update cash and position.
+
+        Handles three cases:
+        1. New long position (no existing position)
+        2. Adding to an existing long position
+        3. Buy-to-cover (existing qty < 0): covers do not consume cash;
+           they reduce/eliminate a short liability.
+        """
+        positions = get_positions()
+        existing = next((p for p in positions if p["ticker"] == ticker), None)
+
+        existing_qty = existing["quantity"] if existing else 0.0
+        is_cover = existing_qty < 0
+
         cost = quantity * price
-        if cost > self.cash:
+
+        # Cash check only applies to genuine new buys, not buy-to-cover.
+        # Covering a short returns collateral rather than spending cash.
+        if not is_cover and cost > self.cash:
             logger.warning(
                 "Insufficient cash to buy %d shares of %s at %.2f "
                 "(cost=%.2f, available=%.2f); trade rejected",
@@ -107,27 +123,40 @@ class PortfolioService:
             )
             return
 
-        positions = get_positions()
-        existing = next((p for p in positions if p["ticker"] == ticker), None)
-
         if existing:
             new_quantity = existing["quantity"] + quantity
-            new_avg_cost = (
-                (existing["avg_cost"] * existing["quantity"]) + (price * quantity)
-            ) / new_quantity
+            if new_quantity == 0:
+                # Full cover: position is flat — avg_cost is irrelevant
+                new_avg_cost = 0.0
+            elif new_quantity < 0:
+                # Partial cover: still short — preserve original entry price
+                new_avg_cost = existing["avg_cost"]
+            elif is_cover:
+                # Over-cover: flipped from short to long — cost basis is the cover price only
+                new_avg_cost = price
+            else:
+                # Adding to an existing long position
+                new_avg_cost = (
+                    (existing["avg_cost"] * existing["quantity"]) + (price * quantity)
+                ) / new_quantity
         else:
             new_quantity = quantity
             new_avg_cost = price
 
-        self.cash -= cost
+        # For covers, cash does not change (Alpaca handles collateral return on settlement).
+        # For genuine buys, deduct the cost.
+        if not is_cover:
+            self.cash -= cost
+
         update_position(ticker, new_quantity, new_avg_cost)
 
         logger.info(
-            "BUY recorded: %d shares of %s at %.2f (total=%.2f, cash_remaining=%.2f)",
+            "BUY recorded: %d shares of %s at %.2f (cost=%.2f, is_cover=%s, cash_remaining=%.2f)",
             quantity,
             ticker,
             price,
             cost,
+            is_cover,
             self.cash,
         )
 

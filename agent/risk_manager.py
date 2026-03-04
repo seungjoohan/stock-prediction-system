@@ -59,11 +59,21 @@ class RiskManager:
         forced = self._check_stop_loss_take_profit(
             portfolio_state, current_prices or {}
         )
-        # Merge: forced sells take priority; don't duplicate tickers already proposed
-        proposed_tickers = {t.ticker for t in candidates if t.action == "sell"}
-        for sell in forced:
-            if sell.ticker not in proposed_tickers:
-                candidates.insert(0, sell)
+        # Merge: forced stop-loss actions always take priority over LLM proposals.
+        # Remove any LLM proposal for the same ticker so the forced action (full
+        # position exit, confidence=1.0, urgency="immediate") is not silently
+        # replaced by a smaller or lower-confidence LLM trade on the same ticker.
+        forced_tickers = {f.ticker for f in forced}
+        if forced_tickers:
+            dropped = [t for t in candidates if t.ticker in forced_tickers]
+            for t in dropped:
+                logger.warning(
+                    "LLM proposal %s %s qty=%d overridden by forced stop-loss action",
+                    t.action, t.ticker, t.quantity,
+                )
+            candidates = [t for t in candidates if t.ticker not in forced_tickers]
+        for f in forced:
+            candidates.insert(0, f)
 
         approved: list[TradeAction] = []
         # Track cash committed by buys approved earlier in this same cycle so
@@ -76,8 +86,19 @@ class RiskManager:
         for trade in candidates:
             is_sell = trade.action == "sell"
 
-            # Rule 1: Minimum confidence (buys only)
-            if not is_sell and trade.confidence < MIN_TRADE_CONFIDENCE:
+            # Detect buy-to-cover: a buy against a ticker currently held short.
+            # Covers must bypass buy-side restrictions (cash, daily limits, VIX, concentration)
+            # because they reduce risk rather than adding new exposure.
+            short_qty = 0.0
+            if not is_sell:
+                for pos in portfolio_state.get("positions", []):
+                    if pos.get("ticker") == trade.ticker and pos.get("quantity", 0) < 0:
+                        short_qty = pos["quantity"]
+                        break
+            is_cover = not is_sell and short_qty < 0
+
+            # Rule 1: Minimum confidence (new buys only — not covers or sells)
+            if not is_sell and not is_cover and trade.confidence < MIN_TRADE_CONFIDENCE:
                 logger.info(
                     "REJECTED %s %s: confidence %.2f below minimum %.2f",
                     trade.action,
@@ -87,8 +108,8 @@ class RiskManager:
                 )
                 continue
 
-            # Rule 2: Max trades per day (buys only — sells are always allowed)
-            if not is_sell and self._trades_today >= MAX_TRADES_PER_DAY:
+            # Rule 2: Max trades per day (new buys only — covers and sells are always allowed)
+            if not is_sell and not is_cover and self._trades_today >= MAX_TRADES_PER_DAY:
                 logger.info(
                     "REJECTED buy %s: daily trade limit %d reached",
                     trade.ticker,
@@ -96,8 +117,8 @@ class RiskManager:
                 )
                 continue
 
-            # Rule 3: Max daily loss circuit breaker (blocks new buys only)
-            if not is_sell and daily_loss_exceeded:
+            # Rule 3: Max daily loss circuit breaker (blocks new buys only — not covers)
+            if not is_sell and not is_cover and daily_loss_exceeded:
                 logger.info(
                     "REJECTED %s %s: daily loss circuit breaker triggered (loss >= %.1f%%)",
                     trade.action,
@@ -106,8 +127,8 @@ class RiskManager:
                 )
                 continue
 
-            # Rule 4: VIX circuit breaker (blocks buys only)
-            if not is_sell and macro_snapshot is not None:
+            # Rule 4: VIX circuit breaker (blocks new buys only — not covers)
+            if not is_sell and not is_cover and macro_snapshot is not None:
                 vix = macro_snapshot.get("vix")
                 if vix is not None and vix > VIX_CIRCUIT_BREAKER:
                     logger.info(
@@ -119,7 +140,8 @@ class RiskManager:
                     continue
 
             # Rule 5+6: Trim buy quantity to fit within cash reserve AND position size limits
-            if not is_sell:
+            # Covers bypass this entirely — they return collateral rather than spending cash.
+            if not is_sell and not is_cover:
                 total_value = portfolio_state.get("total_value", 0)
                 # Use actual cash, not buying_power — buying_power can include Alpaca margin
                 # (2× cash on margin accounts), which would let the risk manager approve trades
@@ -181,10 +203,11 @@ class RiskManager:
                         )
                 # If price is unknown, skip size/cash enforcement and proceed to Rule 7+8
 
-            # Rule 7: Concentration limit — max positions for new buys
-            if not is_sell:
+            # Rule 7: Concentration limit — new buys only (covers reduce exposure, not add it)
+            if not is_sell and not is_cover:
                 positions = portfolio_state.get("positions", [])
-                held_tickers = {p["ticker"] for p in positions if p.get("quantity", 0) > 0}
+                # Include both longs (qty > 0) and shorts (qty < 0) in occupied-slot count
+                held_tickers = {p["ticker"] for p in positions if p.get("quantity", 0) != 0}
                 ticker_is_new = trade.ticker not in held_tickers
                 if ticker_is_new and len(held_tickers) >= MAX_POSITIONS:
                     logger.info(
@@ -194,8 +217,8 @@ class RiskManager:
                     )
                     continue
 
-            # Rule 8: Earnings blackout (no new buys within blackout window)
-            if not is_sell and self._check_earnings_blackout(trade.ticker, fundamentals):
+            # Rule 8: Earnings blackout (no new buys within blackout window — not covers)
+            if not is_sell and not is_cover and self._check_earnings_blackout(trade.ticker, fundamentals):
                 logger.info(
                     "REJECTED buy %s: within %d-day earnings blackout period",
                     trade.ticker,
@@ -224,7 +247,7 @@ class RiskManager:
                             continue
 
             approved.append(trade)
-            if not is_sell:
+            if not is_sell and not is_cover:
                 self._trades_today += 1
                 # Deduct the cost from the intra-cycle cash budget so subsequent
                 # buys in the same decision cycle see reduced available cash.
@@ -322,32 +345,49 @@ class RiskManager:
     def _check_stop_loss_take_profit(
         self, portfolio_state: dict, current_prices: dict
     ) -> list[TradeAction]:
-        """Return forced sell TradeActions for any position that hits stop-loss or take-profit."""
+        """Return forced TradeActions for any position (long or short) that hits stop-loss."""
         forced = []
         for pos in portfolio_state.get("positions", []):
             ticker = pos.get("ticker")
             qty = pos.get("quantity", 0)
             avg_cost = pos.get("avg_cost", 0)
-            if not ticker or qty <= 0 or avg_cost <= 0:
+            if not ticker or qty == 0 or avg_cost <= 0:
                 continue
 
             price = current_prices.get(ticker) or pos.get("current_price", 0)
             if not price:
                 continue
 
-            pnl_pct = (price - avg_cost) / avg_cost
-
-            if pnl_pct <= -STOP_LOSS_PCT:
-                logger.warning(
-                    "STOP-LOSS triggered for %s: down %.1f%% (price=%.2f, avg_cost=%.2f)",
-                    ticker, pnl_pct * 100, price, avg_cost,
-                )
-                forced.append(TradeAction(
-                    ticker=ticker,
-                    action="sell",
-                    quantity=int(qty),
-                    reasoning=f"Stop-loss: position down {pnl_pct:.1%} vs threshold -{STOP_LOSS_PCT:.0%}",
-                    confidence=1.0,
-                    urgency="immediate",
-                ))
+            if qty > 0:
+                # Long: loss when price drops below avg_cost
+                pnl_pct = (price - avg_cost) / avg_cost
+                if pnl_pct <= -STOP_LOSS_PCT:
+                    logger.warning(
+                        "STOP-LOSS triggered for %s (LONG): down %.1f%% (price=%.2f, avg_cost=%.2f)",
+                        ticker, pnl_pct * 100, price, avg_cost,
+                    )
+                    forced.append(TradeAction(
+                        ticker=ticker,
+                        action="sell",
+                        quantity=int(qty),
+                        reasoning=f"Stop-loss: long position down {pnl_pct:.1%} vs threshold -{STOP_LOSS_PCT:.0%}",
+                        confidence=1.0,
+                        urgency="immediate",
+                    ))
+            else:
+                # Short: loss when price rises above avg_cost (short entry price)
+                pnl_pct = (avg_cost - price) / avg_cost
+                if pnl_pct <= -STOP_LOSS_PCT:
+                    logger.warning(
+                        "STOP-LOSS triggered for %s (SHORT): down %.1f%% (price=%.2f, avg_entry=%.2f)",
+                        ticker, pnl_pct * 100, price, avg_cost,
+                    )
+                    forced.append(TradeAction(
+                        ticker=ticker,
+                        action="buy",
+                        quantity=int(abs(qty)),
+                        reasoning=f"Stop-loss: short position down {pnl_pct:.1%} vs threshold -{STOP_LOSS_PCT:.0%}",
+                        confidence=1.0,
+                        urgency="immediate",
+                    ))
         return forced

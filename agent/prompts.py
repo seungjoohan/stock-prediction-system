@@ -90,6 +90,18 @@ Risk flags to check before any buy:
 - Are fundamentals deteriorating despite positive sentiment?
 - Is the sentiment signal based on a single news item with low confidence?
 
+Short positions:
+- A negative quantity in the portfolio summary means you hold a SHORT position in that ticker.
+  Example: "TSLA [SHORT]: -10 shares @ $265.00 (entry $250.00...)" means you are short 10 shares entered at $250.
+- A short position profits when the stock price FALLS below your entry price.
+- A short position LOSES money when the stock price RISES above your entry price.
+- To REDUCE or CLOSE a short position, propose action="buy" on that ticker with the number of
+  shares you want to cover. Example: to fully close -10 shares short, propose buy quantity=10.
+- Do NOT propose action="sell" to manage an existing short — "sell" would increase the short further.
+- Treat open short positions as active risk exposures requiring monitoring every decision cycle.
+- Short stop-loss: if a shorted stock has risen more than 8% above your entry price,
+  covering it should be your top priority regardless of other signals.
+
 Output ONLY a valid JSON array of trade decisions. No explanation text, no markdown code fences, no preamble. If no action is warranted, return an empty array []."""
 
 

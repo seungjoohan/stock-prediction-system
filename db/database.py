@@ -211,7 +211,7 @@ def get_positions() -> list[dict]:
 def update_position(
     ticker: str, quantity: float, avg_cost: float, current_price: float | None = None
 ) -> None:
-    if quantity <= 0:
+    if quantity == 0:
         with _get_connection() as conn:
             conn.execute("DELETE FROM positions WHERE ticker = ?", [ticker])
         return

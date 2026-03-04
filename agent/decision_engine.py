@@ -103,11 +103,21 @@ def _format_portfolio_summary(portfolio_state: dict) -> str:
             avg_cost = pos.get("avg_cost", 0.0)
             pos_value = qty * price
             unrealized = (price - avg_cost) * qty if avg_cost else 0.0
-            lines.append(
-                f"  {ticker}: {qty} shares @ ${price:.2f} "
-                f"(avg cost ${avg_cost:.2f}, value ${pos_value:,.2f}, "
-                f"unrealized P&L ${unrealized:,.2f})"
-            )
+            if qty < 0:
+                # Short position: P&L is positive when price falls below entry
+                pnl_pct = ((avg_cost - price) / avg_cost * 100) if avg_cost else 0.0
+                lines.append(
+                    f"  {ticker} [SHORT]: {qty} shares @ ${price:.2f} "
+                    f"(entry ${avg_cost:.2f}, exposure ${abs(pos_value):,.2f}, "
+                    f"unrealized P&L ${unrealized:,.2f} / {pnl_pct:+.1f}%) "
+                    f"— ACTION TO REDUCE: buy"
+                )
+            else:
+                lines.append(
+                    f"  {ticker}: {qty} shares @ ${price:.2f} "
+                    f"(avg cost ${avg_cost:.2f}, value ${pos_value:,.2f}, "
+                    f"unrealized P&L ${unrealized:,.2f})"
+                )
 
     return "\n".join(lines)
 
