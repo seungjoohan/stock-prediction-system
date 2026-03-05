@@ -17,6 +17,7 @@ import yfinance as yf
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config.settings import DB_PATH, INITIAL_CAPITAL, ALPACA_API_KEY, ALPACA_SECRET_KEY
+from db.database import get_connection
 
 st.set_page_config(page_title="Trading Agent Dashboard", layout="wide")
 
@@ -39,9 +40,7 @@ def _to_et(ts_str, date_only: bool = False) -> str:
 
 
 def get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return get_connection()
 
 
 @st.cache_data(ttl=30)

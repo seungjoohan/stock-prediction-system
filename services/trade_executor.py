@@ -4,7 +4,7 @@ import time
 from datetime import datetime, timezone
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, ClosePositionRequest
+from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL
@@ -104,7 +104,7 @@ class TradeExecutor:
             except Exception:
                 pass
 
-        insert_trade({
+        trade_id = insert_trade({
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "ticker": ticker,
             "action": action_lower,
@@ -127,6 +127,7 @@ class TradeExecutor:
 
         order_dict = {
             "id": order_id,
+            "trade_id": trade_id,
             "ticker": ticker,
             "action": action_lower,
             "quantity": quantity,
@@ -182,14 +183,58 @@ class TradeExecutor:
 
     def close_position(self, ticker: str) -> dict | None:
         """Close entire position for a ticker."""
+        # Determine position side before closing so we know the correct action
+        action = "sell"  # default for closing longs
+        avg_cost_at_time = None
+        try:
+            positions = get_positions()
+            pos = next((p for p in positions if p["ticker"] == ticker), None)
+            if pos:
+                avg_cost_at_time = pos["avg_cost"]
+                if pos["quantity"] < 0:
+                    action = "buy"  # buy-to-cover for shorts
+        except Exception:
+            pass
+
         try:
             order = self.client.close_position(ticker)
+            order_id = str(order.id)
+
+            # Wait briefly for fill price (paper orders fill near-instantly)
+            for _ in range(6):
+                if order.filled_avg_price is not None:
+                    break
+                time.sleep(0.5)
+                try:
+                    order = self.client.get_order_by_id(order_id)
+                except Exception:
+                    break
+
+            filled_qty = float(order.filled_qty or order.qty or 0)
+            filled_price = float(order.filled_avg_price or 0.0)
+
             order_dict = {
-                "id": str(order.id),
+                "id": order_id,
                 "ticker": ticker,
-                "action": "sell",
+                "action": action,
+                "quantity": filled_qty,
+                "price": filled_price,
                 "status": str(order.status),
             }
+
+            insert_trade({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "ticker": ticker,
+                "action": action,
+                "quantity": filled_qty,
+                "price": filled_price,
+                "total_value": filled_qty * filled_price,
+                "reasoning": "position closed (stop-loss/risk)",
+                "confidence": 0.0,
+                "order_id": order_id,
+                "avg_cost_at_time": avg_cost_at_time,
+            })
+
             insert_agent_log("position_closed", order_dict, ticker)
             logger.info("Closed position for %s, order_id=%s", ticker, order.id)
             return order_dict

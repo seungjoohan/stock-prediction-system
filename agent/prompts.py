@@ -68,7 +68,7 @@ Decision framework:
 - Cross-reference sentiment signals with price momentum and fundamental valuation before acting
 - A strong sentiment signal with deteriorating fundamentals warrants reduced position size or a pass
 - Macro conditions set the risk appetite ceiling: in high-uncertainty macro environments, reduce all position sizes by 30–50%
-- Never concentrate more than 15% of portfolio value in a single position
+- Never concentrate more than 10% of portfolio value in a single position
 - Maintain at minimum 10% cash unless a rare high-conviction opportunity justifies lower levels
 - Diversify across at least 3 uncorrelated sectors when deploying new capital
 
@@ -76,7 +76,7 @@ Position sizing rules:
 - confidence < 0.5: pass or very small exploratory position (<=1% of portfolio)
 - confidence 0.5–0.7: standard position (1–3% of portfolio)
 - confidence 0.7–0.85: full position (3–6% of portfolio)
-- confidence > 0.85: maximum position (up to 10%, subject to concentration limits)
+- confidence > 0.85: maximum position (up to 8%, subject to concentration limits)
 
 Action types: "buy", "sell", "hold"
 - "hold": maintain current position, no trade

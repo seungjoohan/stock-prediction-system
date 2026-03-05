@@ -107,26 +107,28 @@ class TestPortfolioServiceRecordSell(unittest.TestCase):
         self.assertAlmostEqual(svc.realized_pnl, 100.0)
 
     @patch(f"{_DB_MODULE}.update_position")
-    def test_record_sell_caps_at_held_quantity(self, mock_update):
+    def test_record_sell_beyond_held_goes_short(self, mock_update):
         with self._patch_positions(qty=5, avg_cost=100.0):
             svc = self._make_service_with_position(cash=50000.0)
             svc.record_sell("AAPL", 100, 120.0)
-        # capped at 5 shares; update called with new_qty=0
-        mock_update.assert_called_once_with("AAPL", 0, 100.0)
-        # proceeds = 5 * 120 = 600
-        self.assertAlmostEqual(svc.cash, 50600.0)
+        # 5 held - 100 sold = -95 (net short); cost basis flips to sale price
+        mock_update.assert_called_once_with("AAPL", -95, 120.0)
+        # proceeds = 100 * 120 = 12000; realized pnl on 5 long shares = (120-100)*5 = 100
+        self.assertAlmostEqual(svc.cash, 62000.0)
+        self.assertAlmostEqual(svc.realized_pnl, 100.0)
 
     @patch(f"{_DB_MODULE}.update_position")
     @patch(f"{_DB_MODULE}.get_positions", return_value=[])
-    def test_record_sell_no_position_does_not_raise(self, mock_get_pos, mock_update):
+    def test_record_sell_no_position_opens_short(self, mock_get_pos, mock_update):
         from services.portfolio import PortfolioService
         with patch(f"{_DB_MODULE}.get_latest_portfolio_snapshot", return_value=None):
             svc = PortfolioService()
-        try:
-            svc.record_sell("AAPL", 5, 120.0)
-        except Exception as exc:
-            self.fail(f"record_sell raised unexpectedly: {exc}")
-        mock_update.assert_not_called()
+        svc.cash = 50000.0
+        svc.record_sell("AAPL", 5, 120.0)
+        # Should create a short position with -5 shares at 120.0
+        mock_update.assert_called_once_with("AAPL", -5, 120.0)
+        # Cash increases by proceeds (5 * 120 = 600)
+        self.assertAlmostEqual(svc.cash, 50600.0)
 
     @patch(f"{_DB_MODULE}.update_position")
     def test_record_sell_updates_position_quantity(self, mock_update):

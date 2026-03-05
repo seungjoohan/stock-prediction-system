@@ -1,4 +1,5 @@
 import logging
+import queue
 import threading
 import time
 from datetime import datetime, date
@@ -14,7 +15,7 @@ from config.settings import (
     MARKET_CLOSE_MINUTE,
     STOP_LOSS_PCT,
 )
-from db.database import init_db, insert_agent_log, get_company_fundamentals, upsert_live_prices
+from db.database import init_db, insert_agent_log, insert_confidence_record, get_company_fundamentals, upsert_live_prices
 from services.market_data import MarketDataService
 from services.news_ingestion import fetch_latest_news
 from services.fundamentals import FundamentalsService
@@ -47,6 +48,7 @@ class AgentCore:
         self._rag = RAGService()
 
         self._trade_lock = threading.Lock()
+        self._stop_loss_queue: queue.Queue = queue.Queue()
         self.recent_sentiment: list[dict] = []
         self._minutes_elapsed = 0
         self._last_setup_date: date | None = None
@@ -169,6 +171,9 @@ class AgentCore:
                 logger.debug("Outside market hours; sleeping 60s")
                 time.sleep(60)
                 continue
+
+            # Drain queued stop-losses every minute tick (not just every 15 min).
+            self._drain_stop_loss_queue()
 
             if self._minutes_elapsed % NEWS_POLL_INTERVAL_MIN == 0:
                 self._fetch_and_analyze_news()
@@ -366,6 +371,17 @@ class AgentCore:
                     elif trade.action == "sell":
                         self._portfolio.record_sell(trade.ticker, trade.quantity, filled_price)
 
+                    try:
+                        insert_confidence_record(
+                            trade_id=result.get("trade_id", 0),
+                            ticker=trade.ticker,
+                            action=trade.action,
+                            confidence=trade.confidence,
+                            entry_price=filled_price,
+                        )
+                    except Exception as exc:
+                        logger.warning("Failed to insert confidence record: %s", exc)
+
                 logger.info(
                     "Trade executed: %s %d %s @ %.2f (confidence=%.2f)",
                     trade.action.upper(),
@@ -397,6 +413,74 @@ class AgentCore:
                     {"action": trade.action, "ticker": trade.ticker, "error": str(exc)},
                     ticker=trade.ticker,
                 )
+
+    def _drain_stop_loss_queue(self):
+        """Process all queued stop-loss symbols with the trade lock held."""
+        symbols: set[str] = set()
+        while not self._stop_loss_queue.empty():
+            try:
+                symbols.add(self._stop_loss_queue.get_nowait())
+            except queue.Empty:
+                break
+
+        if not symbols:
+            return
+
+        acquired = self._trade_lock.acquire(timeout=5)
+        if not acquired:
+            logger.warning(
+                "Could not acquire trade lock to process stop-loss queue; "
+                "re-queuing %d symbol(s) for next tick", len(symbols),
+            )
+            for s in symbols:
+                self._stop_loss_queue.put(s)
+            return
+
+        try:
+            for symbol in symbols:
+                try:
+                    positions = self._executor.get_positions()
+                    pos = next((p for p in positions if p["ticker"] == symbol), None)
+                    if pos is None:
+                        continue
+                    qty = float(pos["quantity"])
+                    if qty == 0:
+                        continue
+                    avg_entry = float(pos["avg_entry_price"])
+                    if avg_entry <= 0:
+                        continue
+                    price = self._market_data.get_price(symbol)
+                    if price is None:
+                        continue
+                    if qty > 0:
+                        pnl_pct = (price - avg_entry) / avg_entry
+                    else:
+                        pnl_pct = (avg_entry - price) / avg_entry
+                    if pnl_pct > -STOP_LOSS_PCT:
+                        logger.info("Stop-loss no longer needed for %s (pnl=%.2f%%)", symbol, pnl_pct * 100)
+                        continue
+
+                    result = self._executor.close_position(symbol)
+                    if result:
+                        account = self._executor.get_account()
+                        updated_positions = self._executor.get_positions()
+                        self._portfolio.sync_from_alpaca(account, updated_positions)
+                        insert_agent_log(
+                            "emergency_stop_loss",
+                            {
+                                "ticker": symbol,
+                                "pnl_pct": pnl_pct,
+                                "price": price,
+                                "side": "long" if qty > 0 else "short",
+                                "order_id": result.get("id"),
+                            },
+                            ticker=symbol,
+                        )
+                        logger.info("Emergency stop-loss executed for %s", symbol)
+                except Exception as exc:
+                    logger.error("Failed to process queued stop-loss for %s: %s", symbol, exc)
+        finally:
+            self._trade_lock.release()
 
     def _on_significant_move(self, symbol: str, change: float, price: float) -> None:
         logger.info(
@@ -445,43 +529,11 @@ class AgentCore:
                 "long" if qty > 0 else "short",
             )
 
-            # Use non-blocking acquire so the callback never deadlocks the WebSocket thread.
-            # If the main loop is mid-trade, skip the emergency close here — the scheduled
-            # _check_stop_loss_take_profit() running every 15 min is the fallback.
-            acquired = self._trade_lock.acquire(blocking=False)
-            if not acquired:
-                logger.warning(
-                    "Stop-loss skipped for %s — trade lock held by main loop. "
-                    "The 15-min scheduled check will catch it next cycle.",
-                    symbol,
-                )
-                insert_agent_log(
-                    "stop_loss_skipped_lock_held",
-                    {"ticker": symbol, "pnl_pct": pnl_pct, "price": price},
-                    ticker=symbol,
-                )
-                return
-
-            try:
-                result = self._executor.close_position(symbol)
-                if result:
-                    account = self._executor.get_account()
-                    updated_positions = self._executor.get_positions()
-                    self._portfolio.sync_from_alpaca(account, updated_positions)
-                    insert_agent_log(
-                        "emergency_stop_loss",
-                        {
-                            "ticker": symbol,
-                            "pnl_pct": pnl_pct,
-                            "price": price,
-                            "side": "long" if qty > 0 else "short",
-                            "order_id": result.get("id"),
-                        },
-                        ticker=symbol,
-                    )
-                    logger.info("Emergency stop-loss executed for %s", symbol)
-            finally:
-                self._trade_lock.release()
+            # Enqueue the symbol for the main loop to process with the trade lock.
+            # This avoids deadlocking the WebSocket thread and ensures stop-losses
+            # are retried every minute tick instead of being silently dropped.
+            self._stop_loss_queue.put(symbol)
+            logger.info("Queued stop-loss for %s (pnl=%.2f%%)", symbol, pnl_pct * 100)
 
         except Exception as exc:
             logger.error("Emergency stop-loss check failed for %s: %s", symbol, exc)

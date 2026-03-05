@@ -2,6 +2,8 @@ import unittest
 from datetime import date, timedelta
 from unittest.mock import patch
 
+_RM_MODULE = "agent.risk_manager"
+
 from agent.risk_manager import RiskManager, TradeAction
 
 
@@ -57,7 +59,14 @@ class TestTradeActionDataclass(unittest.TestCase):
 
 class TestRiskManagerValidateTrades(unittest.TestCase):
     def setUp(self):
-        self.rm = RiskManager()
+        with patch("agent.risk_manager.get_trades", return_value=[]):
+            self.rm = RiskManager()
+        # Prevent drawdown halt from interfering with tests
+        self._peak_patcher = patch("agent.risk_manager.get_max_equity_since", return_value=None)
+        self._peak_patcher.start()
+
+    def tearDown(self):
+        self._peak_patcher.stop()
 
     # Rule 1: Minimum confidence (buys only)
     def test_low_confidence_buy_rejected(self):
@@ -197,10 +206,10 @@ class TestRiskManagerValidateTrades(unittest.TestCase):
 
     # Rule 6: Max position size (buys only) — trims quantity instead of rejecting
     def test_max_position_size(self):
-        # total_value=100000; buy 350 shares at $110 = $38500 (38.5% > 30%)
-        # max_qty_by_position = floor(100000 * 0.30 / 110) = 272
+        from config.settings import MAX_POSITION_PCT
+        # total_value=100000; buy 350 shares at $110
+        # max_qty_by_position = floor(100000 * MAX_POSITION_PCT / 110)
         # cash=90000 → available=85000 → max_qty_by_cash=772 (not limiting)
-        # final_qty = min(350, 772, 272) = 272 → trimmed
         portfolio = _base_portfolio(
             cash=90000.0,
             total_value=100000.0,
@@ -210,16 +219,19 @@ class TestRiskManagerValidateTrades(unittest.TestCase):
         )
         trade = _make_trade(ticker="AAPL", action="buy", quantity=350, confidence=0.9)
         result = self.rm.validate_trades([trade], portfolio)
+        expected_qty = int(100000.0 * MAX_POSITION_PCT / 110.0)
         self.assertEqual(len(result), 1)
-        self.assertEqual(result[0].quantity, 272)  # floor(100000 * 0.30 / 110)
+        self.assertEqual(result[0].quantity, expected_qty)
 
     def test_max_position_size_fully_at_cap_rejected(self):
-        # Existing position already at 30% cap → room=0 → rejected
+        from config.settings import MAX_POSITION_PCT
+        # Existing position already at cap → room=0 → rejected
+        at_cap_qty = int(100000.0 * MAX_POSITION_PCT / 110.0) + 1
         portfolio = _base_portfolio(
             cash=70000.0,
             total_value=100000.0,
             positions=[
-                {"ticker": "AAPL", "quantity": 273, "current_price": 110.0, "avg_cost": 110.0}
+                {"ticker": "AAPL", "quantity": at_cap_qty, "current_price": 110.0, "avg_cost": 110.0}
             ],
         )
         trade = _make_trade(ticker="AAPL", action="buy", quantity=10, confidence=0.9)

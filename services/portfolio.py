@@ -1,4 +1,5 @@
 import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -29,6 +30,7 @@ class PortfolioState:
 
 class PortfolioService:
     def __init__(self):
+        self._lock = threading.Lock()
         self.realized_pnl = 0.0
         self.buying_power = 0.0
         self._alpaca_unrealized = 0.0
@@ -46,6 +48,10 @@ class PortfolioService:
 
     def get_state(self, current_prices: dict[str, float]) -> PortfolioState:
         """Get current portfolio state with live prices."""
+        with self._lock:
+            return self._get_state_unlocked(current_prices)
+
+    def _get_state_unlocked(self, current_prices: dict[str, float]) -> PortfolioState:
         positions = get_positions()
         enriched = []
         positions_value = 0.0
@@ -101,6 +107,10 @@ class PortfolioService:
         3. Buy-to-cover (existing qty < 0): covers do not consume cash;
            they reduce/eliminate a short liability.
         """
+        with self._lock:
+            self._record_buy_unlocked(ticker, quantity, price)
+
+    def _record_buy_unlocked(self, ticker: str, quantity: int, price: float):
         positions = get_positions()
         existing = next((p for p in positions if p["ticker"] == ticker), None)
 
@@ -162,34 +172,56 @@ class PortfolioService:
 
     def record_sell(self, ticker: str, quantity: int, price: float):
         """Record a sell trade -- update cash, position, and realized P&L."""
+        with self._lock:
+            self._record_sell_unlocked(ticker, quantity, price)
+
+    def _record_sell_unlocked(self, ticker: str, quantity: int, price: float):
+        """Handles three cases:
+        1. Selling from an existing long position (partial or full)
+        2. Short entry (no existing position or qty <= 0)
+        3. Selling beyond held qty (flipping from long to net short)
+        """
         positions = get_positions()
         existing = next((p for p in positions if p["ticker"] == ticker), None)
 
-        if not existing or existing["quantity"] <= 0:
-            logger.warning(
-                "Cannot sell %s: no position held; trade rejected",
+        existing_qty = existing["quantity"] if existing else 0.0
+
+        if existing_qty <= 0:
+            # Short entry: no long position to sell — open/add to a short
+            proceeds = quantity * price
+            self.cash += proceeds
+
+            new_quantity = existing_qty - quantity
+            # Preserve existing short avg_cost when adding to short; use sale price for new short
+            new_avg_cost = existing["avg_cost"] if (existing and existing_qty < 0) else price
+            update_position(ticker, new_quantity, new_avg_cost)
+
+            logger.info(
+                "SHORT ENTRY recorded: %d shares of %s at %.2f "
+                "(proceeds=%.2f, cash=%.2f)",
+                quantity,
                 ticker,
+                price,
+                proceeds,
+                self.cash,
             )
             return
 
-        if quantity > existing["quantity"]:
-            logger.warning(
-                "Sell quantity %d exceeds held quantity %.2f for %s; capping at held quantity",
-                quantity,
-                existing["quantity"],
-                ticker,
-            )
-            quantity = int(existing["quantity"])
-
+        # Selling from an existing long position
         avg_cost_at_time = existing["avg_cost"]
+
+        # Allow selling beyond held qty (goes net short)
         proceeds = quantity * price
-        pnl = (price - avg_cost_at_time) * quantity
+        pnl_qty = min(quantity, int(existing_qty))
+        pnl = (price - avg_cost_at_time) * pnl_qty
 
         self.cash += proceeds
         self.realized_pnl += pnl
 
-        new_quantity = existing["quantity"] - quantity
-        update_position(ticker, new_quantity, avg_cost_at_time)
+        new_quantity = existing_qty - quantity
+        # If flipping to short, new cost basis is the sale price
+        new_avg_cost = avg_cost_at_time if new_quantity >= 0 else price
+        update_position(ticker, new_quantity, new_avg_cost)
 
         logger.info(
             "SELL recorded: %d shares of %s at %.2f "
@@ -209,6 +241,10 @@ class PortfolioService:
         always reflects the real Alpaca paper account, regardless of whether
         filled_avg_price was available at order submission time.
         """
+        with self._lock:
+            self._sync_from_alpaca_unlocked(account, alpaca_positions)
+
+    def _sync_from_alpaca_unlocked(self, account: dict, alpaca_positions: list[dict]) -> None:
         self.cash = float(account.get("cash", self.cash))
         self.buying_power = float(account.get("buying_power", 0.0))
 

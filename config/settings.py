@@ -15,7 +15,7 @@ FRED_API_KEY = os.getenv("FRED_API_KEY", "")
 
 # --- Agent Settings ---
 INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "100000"))
-MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.20"))
+MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.10"))
 MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.03"))
 MIN_TRADE_CONFIDENCE = float(os.getenv("MIN_TRADE_CONFIDENCE", "0.6"))
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "10"))
@@ -45,6 +45,36 @@ ALLOW_SHORT_SELLING    = os.getenv("ALLOW_SHORT_SELLING", "false").lower() == "t
 MAX_SHORT_POSITIONS    = int(os.getenv("MAX_SHORT_POSITIONS", "5"))
 MAX_SHORT_EXPOSURE_PCT = float(os.getenv("MAX_SHORT_EXPOSURE_PCT", "0.10"))
 MIN_SHORT_CONFIDENCE   = float(os.getenv("MIN_SHORT_CONFIDENCE", "0.80"))
+MAX_SHORT_POSITION_PCT = float(os.getenv("MAX_SHORT_POSITION_PCT", "0.05"))
+
+# --- Drawdown Circuit Breaker ---
+MAX_DRAWDOWN_PCT    = float(os.getenv("MAX_DRAWDOWN_PCT", "0.10"))
+DRAWDOWN_HALT_HOURS = int(os.getenv("DRAWDOWN_HALT_HOURS", "48"))
+
+# --- Sector Exposure ---
+MAX_SECTOR_EXPOSURE_PCT = float(os.getenv("MAX_SECTOR_EXPOSURE_PCT", "0.40"))
+SECTOR_MAP = {
+    "AAPL": "Technology",
+    "MSFT": "Technology",
+    "GOOG": "Technology",
+    "AMZN": "Consumer Discretionary",
+    "NVDA": "Technology",
+    "META": "Technology",
+    "TSLA": "Consumer Discretionary",
+    "JPM": "Financials",
+    "UNH": "Health Care",
+    "JNJ": "Health Care",
+    "XOM": "Energy",
+    "PG": "Consumer Staples",
+    "HD": "Consumer Discretionary",
+    "BA": "Industrials",
+    "DIS": "Communication Services",
+    "AMD": "Technology",
+    "COST": "Consumer Staples",
+    "CRM": "Technology",
+    "SPY": "ETF",
+    "QQQ": "ETF",
+}
 
 # --- Finnhub WebSocket ---
 FINNHUB_WS_URL = "wss://ws.finnhub.io"

@@ -19,6 +19,11 @@ def _get_connection() -> sqlite3.Connection:
     return conn
 
 
+def get_connection() -> sqlite3.Connection:
+    """Public wrapper around _get_connection for use by dashboard and other modules."""
+    return _get_connection()
+
+
 def init_db() -> None:
     db_dir = os.path.dirname(os.path.abspath(DB_PATH))
     os.makedirs(db_dir, exist_ok=True)
@@ -141,6 +146,18 @@ def init_db() -> None:
                 price      REAL NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS confidence_tracking (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_id          INTEGER NOT NULL,
+                ticker            TEXT NOT NULL,
+                action            TEXT NOT NULL,
+                confidence        REAL,
+                entry_price       REAL,
+                entry_date        TEXT NOT NULL,
+                forward_return_5d REAL,
+                evaluated         INTEGER NOT NULL DEFAULT 0
+            );
         """)
         # Live migration: add avg_cost_at_time to existing databases that predate this column.
         existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
@@ -262,6 +279,17 @@ def get_day_open_snapshot(date_str: str) -> dict | None:
             [date_str],
         ).fetchone()
         return dict(row) if row else None
+
+
+def get_max_equity_since(days: int = 20) -> float | None:
+    """Return the maximum total_value from portfolio_snapshots in the last *days* calendar days."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    with _get_connection() as conn:
+        row = conn.execute(
+            "SELECT MAX(total_value) AS peak FROM portfolio_snapshots WHERE timestamp >= ?",
+            [cutoff],
+        ).fetchone()
+        return row["peak"] if row and row["peak"] is not None else None
 
 
 def get_trades(ticker: str | None = None, limit: int = 50) -> list[dict]:
@@ -394,3 +422,34 @@ def get_sentiment_signals(ticker: str, days: int = 7) -> list[dict]:
             [ticker, cutoff],
         ).fetchall()
         return [dict(row) for row in rows]
+
+
+def insert_confidence_record(
+    trade_id: int, ticker: str, action: str, confidence: float, entry_price: float
+) -> int:
+    sql = (
+        "INSERT INTO confidence_tracking "
+        "(trade_id, ticker, action, confidence, entry_price, entry_date) "
+        "VALUES (?, ?, ?, ?, ?, ?)"
+    )
+    with _get_connection() as conn:
+        cursor = conn.execute(
+            sql, [trade_id, ticker, action, confidence, entry_price, _now_iso()]
+        )
+        return cursor.lastrowid
+
+
+def get_unevaluated_confidence_records() -> list[dict]:
+    with _get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM confidence_tracking WHERE evaluated = 0 ORDER BY entry_date"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def update_confidence_forward_return(record_id: int, forward_return: float) -> None:
+    with _get_connection() as conn:
+        conn.execute(
+            "UPDATE confidence_tracking SET forward_return_5d = ?, evaluated = 1 WHERE id = ?",
+            [forward_return, record_id],
+        )

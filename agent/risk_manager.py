@@ -17,8 +17,12 @@ from config.settings import (
     MAX_SHORT_POSITIONS,
     MAX_SHORT_EXPOSURE_PCT,
     MIN_SHORT_CONFIDENCE,
+    MAX_SHORT_POSITION_PCT,
+    MAX_DRAWDOWN_PCT,
+    MAX_SECTOR_EXPOSURE_PCT,
+    SECTOR_MAP,
 )
-from db.database import insert_agent_log
+from db.database import insert_agent_log, get_trades, get_max_equity_since
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +39,17 @@ class TradeAction:
 
 class RiskManager:
     def __init__(self):
-        self._trades_today = 0
         self._trade_date = date.today()
+        self._trades_today = self._count_buys_today()
+
+    def _count_buys_today(self) -> int:
+        """Count today's buy trades from the database."""
+        today_str = self._trade_date.isoformat()
+        trades = get_trades(limit=200)
+        return sum(
+            1 for t in trades
+            if t.get("action") == "buy" and t.get("timestamp", "").startswith(today_str)
+        )
 
     def validate_trades(
         self,
@@ -83,6 +96,20 @@ class RiskManager:
 
         daily_loss_exceeded = self._check_daily_loss(portfolio_state)
 
+        # Rolling drawdown circuit breaker: check if current equity has dropped
+        # more than MAX_DRAWDOWN_PCT below the 20-day high.
+        drawdown_halt = False
+        current_equity = portfolio_state.get("total_value", 0)
+        peak_equity = get_max_equity_since(days=20)
+        if peak_equity and peak_equity > 0 and current_equity > 0:
+            drawdown_pct = (peak_equity - current_equity) / peak_equity
+            if drawdown_pct >= MAX_DRAWDOWN_PCT:
+                drawdown_halt = True
+                logger.warning(
+                    "DRAWDOWN HALT: equity %.2f is %.1f%% below 20-day peak %.2f (threshold %.0f%%)",
+                    current_equity, drawdown_pct * 100, peak_equity, MAX_DRAWDOWN_PCT * 100,
+                )
+
         for trade in candidates:
             is_sell = trade.action == "sell"
 
@@ -127,6 +154,14 @@ class RiskManager:
                 )
                 continue
 
+            # Rule 3b: Rolling drawdown circuit breaker (blocks new entries only)
+            if not is_sell and not is_cover and drawdown_halt:
+                logger.info(
+                    "REJECTED %s %s: rolling drawdown circuit breaker active (>= %.0f%% below 20-day peak)",
+                    trade.action, trade.ticker, MAX_DRAWDOWN_PCT * 100,
+                )
+                continue
+
             # Rule 4: VIX circuit breaker (blocks new buys only — not covers)
             if not is_sell and not is_cover and macro_snapshot is not None:
                 vix = macro_snapshot.get("vix")
@@ -163,7 +198,7 @@ class RiskManager:
                     existing_value = 0.0
                     for pos in portfolio_state.get("positions", []):
                         if pos.get("ticker") == trade.ticker:
-                            existing_value = pos.get("quantity", 0) * (
+                            existing_value = abs(pos.get("quantity", 0)) * (
                                 pos.get("current_price") or pos.get("avg_cost") or price
                             )
                             break
@@ -226,12 +261,52 @@ class RiskManager:
                 )
                 continue
 
+            # Rule 9: Sector exposure limit (new buys only)
+            if not is_sell and not is_cover:
+                trade_sector = SECTOR_MAP.get(trade.ticker)
+                if trade_sector and trade_sector != "ETF":
+                    total_value = portfolio_state.get("total_value", 0)
+                    if total_value > 0:
+                        sector_value = 0.0
+                        for pos in portfolio_state.get("positions", []):
+                            pticker = pos.get("ticker")
+                            pqty = pos.get("quantity", 0)
+                            if pqty > 0 and SECTOR_MAP.get(pticker) == trade_sector:
+                                pprice = pos.get("current_price") or pos.get("avg_cost", 0)
+                                sector_value += pqty * pprice
+                        price = (
+                            (current_prices or {}).get(trade.ticker)
+                            or self._get_current_price(trade.ticker, portfolio_state)
+                        )
+                        if price and price > 0:
+                            new_sector_value = sector_value + trade.quantity * price
+                            if new_sector_value / total_value > MAX_SECTOR_EXPOSURE_PCT:
+                                logger.info(
+                                    "REJECTED buy %s: sector '%s' exposure would reach %.1f%% (limit %.0f%%)",
+                                    trade.ticker, trade_sector,
+                                    (new_sector_value / total_value) * 100,
+                                    MAX_SECTOR_EXPOSURE_PCT * 100,
+                                )
+                                continue
+
             # Detect short entry: sell quantity > held position
             if trade.action == "sell" and alpaca_positions is not None:
                 held = next(
                     (float(p["quantity"]) for p in alpaca_positions if p["ticker"] == trade.ticker),
                     0.0,
                 )
+                if trade.quantity > held:
+                    # Block new short entries during drawdown halt
+                    if drawdown_halt:
+                        logger.info(
+                            "REJECTED short %s: rolling drawdown circuit breaker active",
+                            trade.ticker,
+                        )
+                        if held > 0:
+                            trade = dataclasses.replace(trade, quantity=int(held))
+                        else:
+                            continue
+
                 if trade.quantity > held:
                     short_ok, reason = self._validate_short_entry(
                         trade, held, alpaca_positions,
@@ -290,6 +365,22 @@ class RiskManager:
 
         if trade.confidence < MIN_SHORT_CONFIDENCE:
             return False, f"Confidence {trade.confidence:.2f} below short minimum {MIN_SHORT_CONFIDENCE:.2f}"
+
+        # Per-position short size limit
+        if equity > 0 and entry_price > 0:
+            max_short_value = equity * MAX_SHORT_POSITION_PCT
+            if new_short_value > max_short_value:
+                trimmed_qty = int(max_short_value / entry_price)
+                if trimmed_qty <= 0:
+                    return False, (
+                        f"Short position value would exceed {MAX_SHORT_POSITION_PCT:.0%} of equity "
+                        f"and cannot be trimmed"
+                    )
+                logger.info(
+                    "TRIMMED short %s: quantity %d → %d (per-position limit %.0f%% of equity)",
+                    trade.ticker, trade.quantity, trimmed_qty, MAX_SHORT_POSITION_PCT * 100,
+                )
+                trade.quantity = trimmed_qty
 
         return True, "short approved"
 

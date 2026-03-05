@@ -41,6 +41,7 @@ class MarketDataService:
         self._callbacks: list = []
         self._lock = threading.Lock()
         self._reconnect_delay = 1
+        self._stop_loss_cooldowns: dict[str, float] = {}
 
     def start(self):
         """Start WebSocket connection in a background thread."""
@@ -221,6 +222,16 @@ class MarketDataService:
         if change is None:
             return
         if abs(change) >= SIGNIFICANT_MOVE_PCT:
+            now = time.time()
+            last_spawn = self._stop_loss_cooldowns.get(symbol, 0.0)
+            if now - last_spawn < 60:
+                logger.debug(
+                    "Skipping significant-move thread for %s — cooldown (%.0fs since last)",
+                    symbol, now - last_spawn,
+                )
+                return
+            self._stop_loss_cooldowns[symbol] = now
+
             with self._lock:
                 price = self.prices.get(symbol)
             logger.info(
