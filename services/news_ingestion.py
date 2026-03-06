@@ -1,4 +1,5 @@
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -28,38 +29,54 @@ class FinnhubNewsSource:
     def __init__(self) -> None:
         self._client = finnhub.Client(api_key=FINNHUB_API_KEY)
 
+    def _fetch_symbol(self, symbol: str, date_str: str) -> list[NewsItem]:
+        """Fetch news for a single symbol. Called in parallel by fetch()."""
+        items: list[NewsItem] = []
+        try:
+            articles = self._client.company_news(symbol, _from=date_str, to=date_str)
+            for article in articles:
+                headline = article.get("headline", "").strip()
+                if not headline:
+                    continue
+
+                ts_raw = article.get("datetime", 0)
+                try:
+                    timestamp = datetime.fromtimestamp(ts_raw, tz=timezone.utc)
+                except (OSError, OverflowError, ValueError):
+                    timestamp = datetime.now(timezone.utc)
+
+                items.append(
+                    NewsItem(
+                        id=str(uuid4()),
+                        source="finnhub",
+                        timestamp=timestamp,
+                        headline=headline,
+                        summary=article.get("summary", ""),
+                        tickers=[symbol],
+                        url=article.get("url", ""),
+                        raw_sentiment=0.0,
+                    )
+                )
+        except Exception:
+            logger.exception("Finnhub error fetching news for %s", symbol)
+        return items
+
     def fetch(self, tickers: list[str]) -> list[NewsItem]:
         items: list[NewsItem] = []
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-        for symbol in tickers:
-            try:
-                articles = self._client.company_news(symbol, _from=date_str, to=date_str)
-                for article in articles:
-                    headline = article.get("headline", "").strip()
-                    if not headline:
-                        continue
-
-                    ts_raw = article.get("datetime", 0)
-                    try:
-                        timestamp = datetime.fromtimestamp(ts_raw, tz=timezone.utc)
-                    except (OSError, OverflowError, ValueError):
-                        timestamp = datetime.now(timezone.utc)
-
-                    items.append(
-                        NewsItem(
-                            id=str(uuid4()),
-                            source="finnhub",
-                            timestamp=timestamp,
-                            headline=headline,
-                            summary=article.get("summary", ""),
-                            tickers=[symbol],
-                            url=article.get("url", ""),
-                            raw_sentiment=0.0,
-                        )
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(self._fetch_symbol, symbol, date_str): symbol
+                for symbol in tickers
+            }
+            for future in futures:
+                try:
+                    items.extend(future.result())
+                except Exception:
+                    logger.exception(
+                        "Finnhub error fetching news for %s", futures[future]
                     )
-            except Exception:
-                logger.exception("Finnhub error fetching news for %s", symbol)
 
         return items
 

@@ -4,10 +4,10 @@ import time
 from datetime import datetime, timezone
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
-from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL
+from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY, USE_LIMIT_ORDERS
 from db.database import insert_trade, insert_agent_log, get_positions
 
 logger = logging.getLogger(__name__)
@@ -24,10 +24,11 @@ class TradeExecutor:
             paper=_paper_mode,
         )
 
-    def execute_trade(self, ticker: str, action: str, quantity: int, reasoning: str = "", confidence: float = 0.0) -> dict | None:
-        """Execute a market order via Alpaca.
+    def execute_trade(self, ticker: str, action: str, quantity: int, reasoning: str = "", confidence: float = 0.0, force_market: bool = False) -> dict | None:
+        """Execute an order via Alpaca.
         Returns order dict on success, None on failure.
         Logs to DB regardless of outcome.
+        When force_market=True, always uses market order (for stop-loss exits).
         """
         action_lower = action.lower()
         if action_lower == "buy":
@@ -43,12 +44,35 @@ class TradeExecutor:
             )
             return None
 
-        order_request = MarketOrderRequest(
-            symbol=ticker,
-            qty=quantity,
-            side=side,
-            time_in_force=TimeInForce.DAY,
-        )
+        order_request = None
+        if USE_LIMIT_ORDERS and not force_market:
+            try:
+                quote = self.client.get_latest_quote(ticker)
+                mid = float(quote.ask_price + quote.bid_price) / 2
+                if mid <= 0:
+                    mid = float(quote.ask_price or quote.bid_price)
+                if mid > 0:
+                    buffer = 1.001 if side == OrderSide.BUY else 0.999
+                    limit_price = round(mid * buffer, 2)
+                    order_request = LimitOrderRequest(
+                        symbol=ticker,
+                        qty=quantity,
+                        side=side,
+                        time_in_force=TimeInForce.DAY,
+                        limit_price=limit_price,
+                    )
+                else:
+                    logger.warning("Quote returned zero price for %s, falling back to market order", ticker)
+            except Exception as exc:
+                logger.warning("Failed to get quote for %s, falling back to market order: %s", ticker, exc)
+
+        if order_request is None:
+            order_request = MarketOrderRequest(
+                symbol=ticker,
+                qty=quantity,
+                side=side,
+                time_in_force=TimeInForce.DAY,
+            )
 
         order = None
         order_id = None
@@ -69,6 +93,44 @@ class TradeExecutor:
                     order = self.client.get_order_by_id(order_id)
                 except Exception:
                     break
+
+            # If limit order is still unfilled, cancel and replace with market order
+            if (
+                isinstance(order_request, LimitOrderRequest)
+                and order.filled_avg_price in (None, 0)
+                and str(order.status) in ("new", "accepted", "partially_filled")
+            ):
+                logger.warning(
+                    "Limit order %s unfilled after 3s, replacing with market order for %s",
+                    order_id, ticker,
+                )
+                try:
+                    self.client.cancel_order_by_id(order_id)
+                    market_request = MarketOrderRequest(
+                        symbol=ticker,
+                        qty=quantity,
+                        side=side,
+                        time_in_force=TimeInForce.DAY,
+                    )
+                    order = self.client.submit_order(market_request)
+                    order_id = str(order.id)
+                    for _ in range(6):
+                        if order.filled_avg_price is not None:
+                            break
+                        time.sleep(0.5)
+                        try:
+                            order = self.client.get_order_by_id(order_id)
+                        except Exception:
+                            break
+                except Exception as cancel_exc:
+                    logger.warning(
+                        "Cancel-replace failed for %s (order may have filled): %s",
+                        order_id, cancel_exc,
+                    )
+                    try:
+                        order = self.client.get_order_by_id(order_id)
+                    except Exception:
+                        pass
 
             filled_qty = float(order.filled_qty or order.qty or quantity)
             filled_price = float(order.filled_avg_price or 0.0)
@@ -101,14 +163,14 @@ class TradeExecutor:
                 pos = next((p for p in positions if p["ticker"] == ticker), None)
                 if pos:
                     avg_cost_at_time = pos["avg_cost"]
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Could not fetch avg_cost for %s: %s", ticker, exc)
 
         trade_id = insert_trade({
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "ticker": ticker,
             "action": action_lower,
-            "quantity": quantity,
+            "quantity": filled_qty if order is not None else quantity,
             "price": price,
             "total_value": total_value,
             "reasoning": reasoning,
@@ -193,8 +255,8 @@ class TradeExecutor:
                 avg_cost_at_time = pos["avg_cost"]
                 if pos["quantity"] < 0:
                     action = "buy"  # buy-to-cover for shorts
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Could not fetch position info for %s: %s", ticker, exc)
 
         try:
             order = self.client.close_position(ticker)

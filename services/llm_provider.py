@@ -134,8 +134,8 @@ class LLMProvider:
 
             for attempt in range(1, LLM_MAX_RETRIES + 1):
                 try:
-                    limiter.record_call()
                     content = call_fn(prompt, system_prompt, temperature)
+                    limiter.record_call()
                     return {
                         "content": content,
                         "provider": provider_name,

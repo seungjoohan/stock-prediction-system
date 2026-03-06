@@ -8,7 +8,6 @@ load_dotenv()
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
-ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GOOGLE_GEMINI_API_KEY = os.getenv("GOOGLE_GEMINI_API_KEY", "")
 FRED_API_KEY = os.getenv("FRED_API_KEY", "")
@@ -35,17 +34,21 @@ TRACKED_SYMBOLS = os.getenv("TRACKED_SYMBOLS", _default_symbols).split(",")
 DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "..", "db", "trading.db"))
 
 # --- Risk Thresholds ---
+VIX_TIER1_THRESHOLD = float(os.getenv("VIX_TIER1_THRESHOLD", "20"))   # reduce size 30%
+VIX_TIER2_THRESHOLD = float(os.getenv("VIX_TIER2_THRESHOLD", "25"))   # reduce size 60%
+VIX_TIER3_THRESHOLD = float(os.getenv("VIX_TIER3_THRESHOLD", "30"))   # halt new longs
 VIX_CIRCUIT_BREAKER = float(os.getenv("VIX_CIRCUIT_BREAKER", "35"))
 EARNINGS_BLACKOUT_DAYS = int(os.getenv("EARNINGS_BLACKOUT_DAYS", "2"))
 SIGNIFICANT_MOVE_PCT = float(os.getenv("SIGNIFICANT_MOVE_PCT", "0.02"))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.08"))       # force-sell if position down ≥8%
+TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "0.12"))  # force-sell if price drops ≥12% from peak
 
 # --- Short Selling ---
 ALLOW_SHORT_SELLING    = os.getenv("ALLOW_SHORT_SELLING", "false").lower() == "true"
 MAX_SHORT_POSITIONS    = int(os.getenv("MAX_SHORT_POSITIONS", "5"))
-MAX_SHORT_EXPOSURE_PCT = float(os.getenv("MAX_SHORT_EXPOSURE_PCT", "0.10"))
-MIN_SHORT_CONFIDENCE   = float(os.getenv("MIN_SHORT_CONFIDENCE", "0.80"))
-MAX_SHORT_POSITION_PCT = float(os.getenv("MAX_SHORT_POSITION_PCT", "0.05"))
+MAX_SHORT_EXPOSURE_PCT = float(os.getenv("MAX_SHORT_EXPOSURE_PCT", "0.20"))
+MIN_SHORT_CONFIDENCE   = float(os.getenv("MIN_SHORT_CONFIDENCE", "0.70"))
+MAX_SHORT_POSITION_PCT = float(os.getenv("MAX_SHORT_POSITION_PCT", "0.08"))
 
 # --- Drawdown Circuit Breaker ---
 MAX_DRAWDOWN_PCT    = float(os.getenv("MAX_DRAWDOWN_PCT", "0.10"))
@@ -53,6 +56,7 @@ DRAWDOWN_HALT_HOURS = int(os.getenv("DRAWDOWN_HALT_HOURS", "48"))
 
 # --- Sector Exposure ---
 MAX_SECTOR_EXPOSURE_PCT = float(os.getenv("MAX_SECTOR_EXPOSURE_PCT", "0.40"))
+MAX_GROSS_EXPOSURE_PCT = float(os.getenv("MAX_GROSS_EXPOSURE_PCT", "1.3"))
 SECTOR_MAP = {
     "AAPL": "Technology",
     "MSFT": "Technology",
@@ -78,6 +82,9 @@ SECTOR_MAP = {
 
 # --- Finnhub WebSocket ---
 FINNHUB_WS_URL = "wss://ws.finnhub.io"
+
+# --- Order Type ---
+USE_LIMIT_ORDERS = os.getenv("USE_LIMIT_ORDERS", "true").lower() == "true"
 
 # --- LLM Settings ---
 # Large model: trading decisions (complex reasoning, low volume, 100k TPD)

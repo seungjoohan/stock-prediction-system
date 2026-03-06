@@ -59,14 +59,21 @@ class TestTradeActionDataclass(unittest.TestCase):
 
 class TestRiskManagerValidateTrades(unittest.TestCase):
     def setUp(self):
-        with patch("agent.risk_manager.get_trades", return_value=[]):
+        with patch("agent.risk_manager.get_trades", return_value=[]), \
+             patch("agent.risk_manager.get_water_marks", return_value={}):
             self.rm = RiskManager()
         # Prevent drawdown halt from interfering with tests
         self._peak_patcher = patch("agent.risk_manager.get_max_equity_since", return_value=None)
         self._peak_patcher.start()
+        self._upsert_wm_patcher = patch("agent.risk_manager.upsert_water_mark")
+        self._upsert_wm_patcher.start()
+        self._delete_wm_patcher = patch("agent.risk_manager.delete_water_mark")
+        self._delete_wm_patcher.start()
 
     def tearDown(self):
         self._peak_patcher.stop()
+        self._upsert_wm_patcher.stop()
+        self._delete_wm_patcher.stop()
 
     # Rule 1: Minimum confidence (buys only)
     def test_low_confidence_buy_rejected(self):
@@ -106,8 +113,13 @@ class TestRiskManagerValidateTrades(unittest.TestCase):
         self.assertEqual(len(result), 1)
 
     # Rule 3: Daily loss circuit breaker
+    @patch(f"{_RM_MODULE}.MAX_DAILY_LOSS_PCT", 0.03)
     def test_daily_loss_circuit_breaker(self):
-        portfolio = _base_portfolio(total_value=100000.0, daily_pnl=-3500.0)
+        portfolio = _base_portfolio(
+            total_value=100000.0,
+            daily_pnl=-3500.0,
+            positions=[{"ticker": "AAPL", "quantity": 50, "avg_cost": 150.0, "current_price": 150.0}],
+        )
         buy_trade = _make_trade(action="buy", confidence=0.9)
         sell_trade = _make_trade(action="sell", confidence=0.1)
         result = self.rm.validate_trades([buy_trade, sell_trade], portfolio)
@@ -115,17 +127,33 @@ class TestRiskManagerValidateTrades(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].action, "sell")
 
-    # Rule 4: VIX circuit breaker (blocks buys only)
+    # Rule 4: VIX circuit breaker (blocks new buys and new short entries)
     def test_vix_circuit_breaker_blocks_buys(self):
         macro = {"vix": 40.0}
         buy_trade = _make_trade(ticker="AAPL", action="buy", confidence=0.9)
-        sell_trade = _make_trade(ticker="MSFT", action="sell", confidence=0.1)
+        # Sell MSFT where position is held long — normal sell should pass through
+        sell_trade = _make_trade(ticker="MSFT", action="sell", quantity=10, confidence=0.1)
+        portfolio = _base_portfolio(
+            positions=[
+                {"ticker": "MSFT", "quantity": 10, "current_price": 300.0, "avg_cost": 280.0},
+            ],
+        )
         result = self.rm.validate_trades(
-            [buy_trade, sell_trade], _base_portfolio(), macro_snapshot=macro
+            [buy_trade, sell_trade], portfolio, macro_snapshot=macro
         )
         tickers = [t.ticker for t in result]
         self.assertNotIn("AAPL", tickers)
         self.assertIn("MSFT", tickers)
+
+    def test_vix_tier3_blocks_short_entries(self):
+        """VIX >= 30 (Tier 3) should block new short entries."""
+        macro = {"vix": 32.0}
+        # Sell 10 shares of AAPL with no long position held — this is a short entry
+        short_trade = _make_trade(ticker="AAPL", action="sell", quantity=10, confidence=0.9)
+        result = self.rm.validate_trades(
+            [short_trade], _base_portfolio(), macro_snapshot=macro
+        )
+        self.assertEqual(len(result), 0)
 
     def test_vix_below_threshold_allows_buys(self):
         macro = {"vix": 20.0}
@@ -333,6 +361,165 @@ class TestRiskManagerValidateTrades(unittest.TestCase):
         self.assertEqual(len(result), 1)
         # Sells don't increment the buy counter (reset happened + sell approved)
         self.assertEqual(self.rm._trades_today, 0)
+
+
+    # Issue 15: Short entries blocked by daily loss circuit breaker
+    @patch(f"{_RM_MODULE}.MAX_DAILY_LOSS_PCT", 0.03)
+    def test_daily_loss_blocks_short_entry(self):
+        """A sell that opens a new short should be blocked by daily loss breaker."""
+        portfolio = _base_portfolio(
+            total_value=100000.0,
+            daily_pnl=-3500.0,  # 3.5% loss > 3% threshold
+            positions=[],
+        )
+        short_trade = _make_trade(action="sell", quantity=10, confidence=0.9)
+        result = self.rm.validate_trades([short_trade], portfolio)
+        self.assertEqual(result, [])
+
+    @patch(f"{_RM_MODULE}.MAX_DAILY_LOSS_PCT", 0.03)
+    def test_daily_loss_allows_normal_sell(self):
+        """A sell that closes an existing long should pass even with daily loss breaker."""
+        portfolio = _base_portfolio(
+            total_value=100000.0,
+            daily_pnl=-3500.0,
+            positions=[{"ticker": "AAPL", "quantity": 50, "avg_cost": 150.0, "current_price": 150.0}],
+        )
+        sell_trade = _make_trade(action="sell", quantity=10, confidence=0.1)
+        result = self.rm.validate_trades([sell_trade], portfolio)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].action, "sell")
+
+    # Issue 16: Short entries blocked by earnings blackout
+    def test_earnings_blackout_blocks_short_entry(self):
+        """A sell that opens a short during earnings blackout should be blocked."""
+        today = date.today()
+        earnings_date = today + timedelta(days=1)
+        fundamentals = {"AAPL": {"next_earnings_date": earnings_date.isoformat()}}
+        portfolio = _base_portfolio(
+            cash=90000.0,
+            total_value=100000.0,
+            positions=[],
+        )
+        short_trade = _make_trade(ticker="AAPL", action="sell", quantity=10, confidence=0.9)
+        result = self.rm.validate_trades([short_trade], portfolio, fundamentals=fundamentals)
+        self.assertEqual(result, [])
+
+    def test_earnings_blackout_allows_normal_sell(self):
+        """A sell closing an existing long during earnings blackout should pass."""
+        today = date.today()
+        earnings_date = today + timedelta(days=1)
+        fundamentals = {"AAPL": {"next_earnings_date": earnings_date.isoformat()}}
+        portfolio = _base_portfolio(
+            cash=90000.0,
+            total_value=100000.0,
+            positions=[{"ticker": "AAPL", "quantity": 50, "avg_cost": 150.0, "current_price": 150.0}],
+        )
+        sell_trade = _make_trade(ticker="AAPL", action="sell", quantity=10, confidence=0.9)
+        result = self.rm.validate_trades([sell_trade], portfolio, fundamentals=fundamentals)
+        self.assertEqual(len(result), 1)
+
+
+class TestTrailingStopLoss(unittest.TestCase):
+    def setUp(self):
+        with patch("agent.risk_manager.get_trades", return_value=[]), \
+             patch("agent.risk_manager.get_water_marks", return_value={}):
+            self.rm = RiskManager()
+        self._peak_patcher = patch("agent.risk_manager.get_max_equity_since", return_value=None)
+        self._peak_patcher.start()
+        self._upsert_wm_patcher = patch("agent.risk_manager.upsert_water_mark")
+        self._upsert_wm_patcher.start()
+        self._delete_wm_patcher = patch("agent.risk_manager.delete_water_mark")
+        self._delete_wm_patcher.start()
+
+    def tearDown(self):
+        self._peak_patcher.stop()
+        self._upsert_wm_patcher.stop()
+        self._delete_wm_patcher.stop()
+
+    def test_trailing_stop_long_triggers(self):
+        """Long position: price ran up then dropped 12%+ from peak triggers trailing stop."""
+        portfolio = _base_portfolio(
+            positions=[{"ticker": "AAPL", "quantity": 10, "avg_cost": 100.0, "current_price": 100.0}],
+        )
+        # First call: price at 200 (sets high-water mark)
+        self.rm._check_stop_loss_take_profit(portfolio, {"AAPL": 200.0})
+        self.assertEqual(self.rm._high_water_marks["AAPL"], 200.0)
+
+        # Second call: price drops to 175 (12.5% below 200 peak) -> trailing stop triggers
+        forced = self.rm._check_stop_loss_take_profit(portfolio, {"AAPL": 175.0})
+        self.assertEqual(len(forced), 1)
+        self.assertEqual(forced[0].action, "sell")
+        self.assertIn("Trailing stop", forced[0].reasoning)
+
+    def test_trailing_stop_long_no_trigger_below_threshold(self):
+        """Long position: 10% drop from peak should NOT trigger trailing stop (threshold is 12%)."""
+        portfolio = _base_portfolio(
+            positions=[{"ticker": "AAPL", "quantity": 10, "avg_cost": 100.0, "current_price": 100.0}],
+        )
+        self.rm._check_stop_loss_take_profit(portfolio, {"AAPL": 200.0})
+        # Price at 181 = 9.5% drop from 200 -> no trigger
+        forced = self.rm._check_stop_loss_take_profit(portfolio, {"AAPL": 181.0})
+        self.assertEqual(len(forced), 0)
+
+    def test_trailing_stop_short_triggers(self):
+        """Short position: price dropped then rose 12%+ from trough triggers trailing stop."""
+        portfolio = _base_portfolio(
+            positions=[{"ticker": "TSLA", "quantity": -10, "avg_cost": 200.0, "current_price": 200.0}],
+        )
+        # First call: price at 150 (sets low-water mark)
+        self.rm._check_stop_loss_take_profit(portfolio, {"TSLA": 150.0})
+        self.assertEqual(self.rm._low_water_marks["TSLA"], 150.0)
+
+        # Second call: price rises to 169 (12.67% above 150 trough) -> trailing stop
+        forced = self.rm._check_stop_loss_take_profit(portfolio, {"TSLA": 169.0})
+        self.assertEqual(len(forced), 1)
+        self.assertEqual(forced[0].action, "buy")
+        self.assertIn("Trailing stop", forced[0].reasoning)
+
+    def test_trailing_stop_short_no_trigger_below_threshold(self):
+        """Short position: 10% rise from trough should NOT trigger trailing stop."""
+        portfolio = _base_portfolio(
+            positions=[{"ticker": "TSLA", "quantity": -10, "avg_cost": 200.0, "current_price": 200.0}],
+        )
+        self.rm._check_stop_loss_take_profit(portfolio, {"TSLA": 150.0})
+        # Price at 164 = 9.3% above 150 -> no trigger
+        forced = self.rm._check_stop_loss_take_profit(portfolio, {"TSLA": 164.0})
+        self.assertEqual(len(forced), 0)
+
+    def test_hwm_initialized_from_entry_price(self):
+        """High-water mark should initialize from avg_cost when first seen."""
+        portfolio = _base_portfolio(
+            positions=[{"ticker": "AAPL", "quantity": 10, "avg_cost": 100.0, "current_price": 95.0}],
+        )
+        # Price below avg_cost -> hwm should be avg_cost (100), not price (95)
+        self.rm._check_stop_loss_take_profit(portfolio, {"AAPL": 95.0})
+        self.assertEqual(self.rm._high_water_marks["AAPL"], 100.0)
+
+    def test_water_marks_cleaned_on_position_close(self):
+        """Water marks should be removed when a position disappears."""
+        portfolio = _base_portfolio(
+            positions=[{"ticker": "AAPL", "quantity": 10, "avg_cost": 100.0, "current_price": 150.0}],
+        )
+        self.rm._check_stop_loss_take_profit(portfolio, {"AAPL": 150.0})
+        self.assertIn("AAPL", self.rm._high_water_marks)
+
+        # Position closed
+        empty_portfolio = _base_portfolio(positions=[])
+        self.rm._check_stop_loss_take_profit(empty_portfolio, {})
+        self.assertNotIn("AAPL", self.rm._high_water_marks)
+
+    def test_fixed_stop_takes_priority_over_trailing(self):
+        """When both fixed and trailing stop trigger, fixed stop reason is used."""
+        portfolio = _base_portfolio(
+            positions=[{"ticker": "AAPL", "quantity": 10, "avg_cost": 100.0, "current_price": 100.0}],
+        )
+        # Set hwm to 100 (entry price), then price drops to 87 (13% from entry, 13% from peak)
+        # Both fixed (8% from entry) and trailing (12% from peak) trigger
+        # Fixed should take priority
+        forced = self.rm._check_stop_loss_take_profit(portfolio, {"AAPL": 87.0})
+        self.assertEqual(len(forced), 1)
+        self.assertIn("Stop-loss", forced[0].reasoning)
+        self.assertNotIn("Trailing", forced[0].reasoning)
 
 
 if __name__ == "__main__":

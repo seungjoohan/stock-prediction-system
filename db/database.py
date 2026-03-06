@@ -158,7 +158,18 @@ def init_db() -> None:
                 forward_return_5d REAL,
                 evaluated         INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS water_marks (
+                ticker          TEXT PRIMARY KEY,
+                high_water_mark REAL,
+                low_water_mark  REAL,
+                updated_at      TEXT
+            );
         """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_news_items_headline ON news_items(headline)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_ticker_ts ON trades(ticker, timestamp)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_ts ON portfolio_snapshots(timestamp)")
+
         # Live migration: add avg_cost_at_time to existing databases that predate this column.
         existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
         if "avg_cost_at_time" not in existing_cols:
@@ -453,3 +464,34 @@ def update_confidence_forward_return(record_id: int, forward_return: float) -> N
             "UPDATE confidence_tracking SET forward_return_5d = ?, evaluated = 1 WHERE id = ?",
             [forward_return, record_id],
         )
+
+
+def get_water_marks() -> dict[str, dict]:
+    """Return all water marks as {ticker: {"hwm": float|None, "lwm": float|None}}."""
+    with _get_connection() as conn:
+        rows = conn.execute("SELECT ticker, high_water_mark, low_water_mark FROM water_marks").fetchall()
+        return {
+            row["ticker"]: {"hwm": row["high_water_mark"], "lwm": row["low_water_mark"]}
+            for row in rows
+        }
+
+
+def upsert_water_mark(ticker: str, hwm: float | None = None, lwm: float | None = None) -> None:
+    """Insert or update a ticker's high/low water mark."""
+    now = _now_iso()
+    sql = (
+        "INSERT INTO water_marks (ticker, high_water_mark, low_water_mark, updated_at) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(ticker) DO UPDATE SET "
+        "high_water_mark = COALESCE(excluded.high_water_mark, water_marks.high_water_mark), "
+        "low_water_mark = COALESCE(excluded.low_water_mark, water_marks.low_water_mark), "
+        "updated_at = excluded.updated_at"
+    )
+    with _get_connection() as conn:
+        conn.execute(sql, [ticker, hwm, lwm, now])
+
+
+def delete_water_mark(ticker: str) -> None:
+    """Remove a ticker's water mark entry."""
+    with _get_connection() as conn:
+        conn.execute("DELETE FROM water_marks WHERE ticker = ?", [ticker])

@@ -2,7 +2,7 @@ import logging
 import queue
 import threading
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from config.settings import (
@@ -218,6 +218,9 @@ class AgentCore:
 
         try:
             sentiment_results = self._decision_engine.analyze_sentiment(news_items)
+            now_utc = datetime.now(timezone.utc).isoformat()
+            for sig in sentiment_results:
+                sig["_ingested_at"] = now_utc
             self.recent_sentiment.extend(sentiment_results)
             if len(self.recent_sentiment) > 100:
                 self.recent_sentiment = self.recent_sentiment[-100:]
@@ -292,10 +295,17 @@ class AgentCore:
         except Exception as exc:
             logger.warning("RAG retrieval failed (non-fatal): %s", exc)
 
+        # Filter sentiment signals to only include those from the last 2 hours
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        fresh_sentiment = [
+            s for s in self.recent_sentiment
+            if s.get("_ingested_at", "") >= cutoff
+        ]
+
         try:
             proposed_trades = self._decision_engine.make_decisions(
                 portfolio_state=portfolio_state_dict,
-                sentiment_signals=self.recent_sentiment,
+                sentiment_signals=fresh_sentiment,
                 current_prices=prices,
                 fundamentals=fundamentals,
                 macro_snapshot=macro_snapshot_dict,
@@ -349,6 +359,7 @@ class AgentCore:
                         quantity=trade.quantity,
                         reasoning=trade.reasoning,
                         confidence=trade.confidence,
+                        force_market=trade.urgency == "immediate",
                     )
                     if result is None:
                         logger.warning(

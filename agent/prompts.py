@@ -91,6 +91,17 @@ Risk flags to check before any buy:
 - Is the sentiment signal based on a single news item with low confidence?
 
 Short positions:
+Initiating new short positions:
+- Consider shorting when multiple independent signals align bearishly: negative sentiment from credible sources,
+  deteriorating fundamentals (declining revenue, margin compression, rising debt), AND bearish technical setup
+  (breakdown below support, death cross, rising volume on down moves).
+- Do not short based on a single bearish signal — require convergence across sentiment, fundamentals, and technicals.
+- To initiate a short, propose action="sell" on a ticker you do NOT currently hold. The system will open a short position.
+- Size short positions conservatively: max 8% of portfolio per position. Start smaller (2-4%) and add only if the thesis strengthens.
+- Shorts carry unlimited upside loss — always pair with a mental stop-loss at 8% above entry. If the stock moves against you, cover early.
+- Prefer shorting individual stocks with company-specific catalysts over broad market shorts.
+
+Managing existing short positions:
 - A negative quantity in the portfolio summary means you hold a SHORT position in that ticker.
   Example: "TSLA [SHORT]: -10 shares @ $265.00 (entry $250.00...)" means you are short 10 shares entered at $250.
 - A short position profits when the stock price FALLS below your entry price.
