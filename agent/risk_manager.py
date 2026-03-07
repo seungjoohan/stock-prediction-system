@@ -561,9 +561,9 @@ class RiskManager:
 
     @staticmethod
     def _check_drawdown_halt(portfolio_state: dict) -> bool:
-        """Check if current equity has dropped more than MAX_DRAWDOWN_PCT below the 20-day high."""
+        """Check if current equity has dropped more than MAX_DRAWDOWN_PCT below the 10-day high."""
         current_equity = portfolio_state.get("total_value", 0)
-        peak_equity = get_max_equity_since(days=20)
+        peak_equity = get_max_equity_since(days=10)
         if peak_equity and peak_equity > 0 and current_equity > 0:
             drawdown_pct = (peak_equity - current_equity) / peak_equity
             if drawdown_pct >= MAX_DRAWDOWN_PCT:
